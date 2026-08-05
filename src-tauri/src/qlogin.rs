@@ -42,6 +42,7 @@ const MAX_POLLS: u32 = 180;
 const MAX_REFRESHES: u32 = 3;
 const WEB_LOGIN_URL: &str = "https://i.qq.com";
 const WEB_LOGIN_WINDOW_LABEL: &str = "qq-web-login";
+const MAX_PROFILE_BYTES: usize = 256 * 1024;
 const MAX_AVATAR_BYTES: usize = 2 * 1024 * 1024;
 const REQUIRED_WEB_COOKIES: &[&str] = &["uin", "p_uin", "p_skey", "skey", "pt4_token"];
 const ALLOWED_WEB_COOKIE_DOMAINS: &[&str] = &[
@@ -140,6 +141,7 @@ pub struct QLoginState {
     cancel_epochs: Mutex<HashMap<QrSessionId, u64>>,
     in_flight: Mutex<HashSet<QrSessionId>>,
     lifecycle_commit: Mutex<()>,
+    web_generation: AtomicU64,
 }
 
 pub(crate) struct QzoneAuth {
@@ -166,6 +168,7 @@ impl QLoginState {
             cancel_epochs: Mutex::new(HashMap::new()),
             in_flight: Mutex::new(HashSet::new()),
             lifecycle_commit: Mutex::new(()),
+            web_generation: AtomicU64::new(0),
         }
     }
 
@@ -203,6 +206,7 @@ impl QLoginState {
     pub(crate) async fn clear_session(&self) {
         let _commit = self.lifecycle_commit.lock().await;
         self.generation.fetch_add(1, Ordering::SeqCst);
+        self.web_generation.fetch_add(1, Ordering::SeqCst);
         *self.session.lock().await = None;
         self.sessions.lock().await.clear();
         self.cancel_epochs.lock().await.clear();
@@ -229,7 +233,6 @@ pub struct QzoneLoginUser {
 #[derive(Deserialize)]
 struct UserInfoResponse {
     code: i64,
-    message: Option<String>,
     data: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
@@ -296,11 +299,20 @@ fn cookie_header(cookies: &HashMap<String, String>) -> String {
         .join("; ")
 }
 
-fn normalized_uin(value: &str) -> String {
-    value
-        .trim_start_matches('o')
-        .trim_start_matches('0')
-        .to_owned()
+fn normalized_uin(value: &str) -> Option<String> {
+    let value = value.strip_prefix('o').unwrap_or(value);
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let normalized = value.trim_start_matches('0');
+    (!normalized.is_empty()).then(|| normalized.to_owned())
+}
+
+fn allowed_qq_cookie_domain(domain: Option<&str>) -> bool {
+    domain.is_some_and(|domain| {
+        let normalized = domain.trim_start_matches('.').to_ascii_lowercase();
+        matches!(normalized.as_str(), "qq.com" | "i.qq.com" | "qzone.qq.com")
+    })
 }
 
 fn random_hex(len: usize) -> String {
@@ -728,7 +740,7 @@ async fn poll_inner(state: &QLoginState, id: QrSessionId) -> Result<LoginStatus,
             let callback = u
                 .query_pairs()
                 .find(|(k, _)| k == "uin")
-                .map(|(_, v)| normalized_uin(&v))
+                .and_then(|(_, v)| normalized_uin(&v))
                 .ok_or("登录响应不完整")?;
             let mut final_status = None;
             for _ in 0..=5 {
@@ -790,7 +802,7 @@ async fn poll_inner(state: &QLoginState, id: QrSessionId) -> Result<LoginStatus,
             let Some(cu) = c
                 .get("uin")
                 .or_else(|| c.get("p_uin"))
-                .map(|v| normalized_uin(v))
+                .and_then(|v| normalized_uin(v))
             else {
                 s.clear_secrets();
                 return Ok(login_status(&id, "error", "登录凭据不完整", None));
@@ -881,9 +893,7 @@ fn parse_user_info(text: &str) -> Result<(String, Option<String>), String> {
     let response: UserInfoResponse =
         serde_json::from_str(&text[start..=end]).map_err(|_| "用户资料响应格式不正确")?;
     if response.code != 0 {
-        return Err(response
-            .message
-            .unwrap_or_else(|| "QQ 用户资料接口返回错误".into()));
+        return Err("QQ 用户资料接口返回错误".into());
     }
     let data = response.data.ok_or("QQ 用户资料接口未返回资料")?;
     let value = |names: &[&str]| {
@@ -916,7 +926,20 @@ async fn request_user_info(
     if !response.status().is_success() {
         return Err("QQ 用户资料接口暂时不可用".into());
     }
-    let bytes = response.bytes().await.map_err(|_| "读取 QQ 用户资料失败")?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_PROFILE_BYTES as u64)
+    {
+        return Err("QQ 用户资料响应过大".into());
+    }
+    let mut response = response;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| "读取 QQ 用户资料失败")? {
+        if bytes.len().saturating_add(chunk.len()) > MAX_PROFILE_BYTES {
+            return Err("QQ 用户资料响应过大".into());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
     parse_user_info(&decode_legacy_text(&bytes))
 }
 
@@ -933,7 +956,7 @@ pub async fn get_qzone_login_user(
         .append_pair("get_all", "1")
         .append_pair("uin", &auth.uin)
         .append_pair("g_tk", &auth.g_tk.to_string());
-    let (nickname, avatar) = match request_user_info(&state, &auth, vip).await {
+    let (nickname, _) = match request_user_info(&state, &auth, vip).await {
         Ok(value) => value,
         Err(_) => {
             let mut legacy = Url::parse("https://h5.qzone.qq.com/proxy/domain/base.qzone.qq.com/cgi-bin/user/cgi_userinfo_get_all").map_err(|_| "用户资料地址无效")?;
@@ -946,13 +969,15 @@ pub async fn get_qzone_login_user(
             request_user_info(&state, &auth, legacy).await?
         }
     };
-    let avatar_url =
-        avatar.unwrap_or_else(|| format!("https://q1.qlogo.cn/g?b=qq&nk={}&s=100", auth.uin));
+    let avatar_url = Url::parse_with_params(
+        "https://q1.qlogo.cn/g",
+        &[("b", "qq"), ("nk", auth.uin.as_str()), ("s", "100")],
+    )
+    .map_err(|_| "头像地址无效")?;
     let avatar_image = match state
         .client()
         .get(avatar_url)
         .header(USER_AGENT, &auth.user_agent)
-        .header(reqwest::header::COOKIE, &auth.cookie_header)
         .send()
         .await
     {
@@ -969,12 +994,17 @@ pub async fn get_qzone_login_user(
                 .filter(|v| v.starts_with("image/"))
                 .unwrap_or("image/jpeg")
                 .to_owned();
-            response
-                .bytes()
-                .await
-                .ok()
-                .filter(|b| b.len() <= MAX_AVATAR_BYTES)
-                .map(|b| format!("data:{content_type};base64,{}", BASE64.encode(b)))
+            let mut response = response;
+            let mut bytes = Vec::new();
+            let mut valid = true;
+            while let Ok(Some(chunk)) = response.chunk().await {
+                if bytes.len().saturating_add(chunk.len()) > MAX_AVATAR_BYTES {
+                    valid = false;
+                    break;
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            valid.then(|| format!("data:{content_type};base64,{}", BASE64.encode(bytes)))
         }
         _ => None,
     };
@@ -985,23 +1015,25 @@ pub async fn get_qzone_login_user(
     })
 }
 
+fn clear_window_qq_cookies(window: &tauri::WebviewWindow) -> Result<(), String> {
+    let cookies = window.cookies().map_err(|_| "读取 QQ Cookie 失败")?;
+    for cookie in cookies {
+        if allowed_qq_cookie_domain(cookie.domain())
+            && REQUIRED_WEB_COOKIES.contains(&cookie.name())
+        {
+            window
+                .delete_cookie(cookie)
+                .map_err(|_| "清理 QQ Cookie 失败")?;
+        }
+    }
+    Ok(())
+}
+
 fn clear_web_login_window(app: &tauri::AppHandle) -> Result<(), String> {
     let Some(window) = app.get_webview_window(WEB_LOGIN_WINDOW_LABEL) else {
         return Ok(());
     };
-    let cookies = window
-        .cookies()
-        .map_err(|_| "读取 QQ 登录窗口 Cookie 失败")?;
-    for cookie in cookies {
-        if cookie
-            .domain()
-            .is_some_and(|domain| ALLOWED_WEB_COOKIE_DOMAINS.contains(&domain))
-        {
-            window
-                .delete_cookie(cookie)
-                .map_err(|_| "清理 QQ 登录窗口 Cookie 失败")?;
-        }
-    }
+    clear_window_qq_cookies(&window)?;
     window
         .close()
         .map_err(|_| "关闭 QQ 登录窗口失败".to_owned())
@@ -1013,7 +1045,16 @@ pub async fn logout_qzone(
     state: tauri::State<'_, QLoginState>,
 ) -> Result<(), String> {
     state.clear_session().await;
-    clear_web_login_window(&app)
+    let mut failed = false;
+    if let Some(main) = app.get_webview_window("main") {
+        failed |= clear_window_qq_cookies(&main).is_err();
+    }
+    failed |= clear_web_login_window(&app).is_err();
+    if failed {
+        Err("登录状态已清除，但部分 WebView Cookie 清理失败".into())
+    } else {
+        Ok(())
+    }
 }
 
 #[tauri::command]
@@ -1058,6 +1099,7 @@ pub async fn check_web_login(
     app: tauri::AppHandle,
     state: tauri::State<'_, QLoginState>,
 ) -> Result<LoginStatus, String> {
+    let generation = state.web_generation.load(Ordering::SeqCst);
     let Some(window) = app.get_webview_window(WEB_LOGIN_WINDOW_LABEL) else {
         return Ok(LoginStatus {
             status: "webLoginCancelled",
@@ -1115,26 +1157,40 @@ pub async fn check_web_login(
 
     let uin = cookie_map
         .get("uin")
-        .or_else(|| cookie_map.get("p_uin"))
-        .filter(|v| !v.is_empty())
-        .cloned()
-        .ok_or("登录 Cookie 不完整：缺少账号标识")?;
+        .and_then(|value| normalized_uin(value));
+    let p_uin = cookie_map
+        .get("p_uin")
+        .and_then(|value| normalized_uin(value));
+    if uin.is_some() && p_uin.is_some() && uin != p_uin {
+        return Err("登录 Cookie 中的账号标识不一致".into());
+    }
+    let uin = uin.or(p_uin).ok_or("登录 Cookie 缺少有效账号标识")?;
 
     let g_tk = bkn(&p_skey);
     let user_agent = account_user_agent(&uin);
 
     let session = LoginSession {
         cookies: cookie_map,
-        uin: Some(normalized_uin(&uin)),
+        uin: Some(uin),
         g_tk: Some(g_tk),
         user_agent,
     };
 
+    let _commit = state.lifecycle_commit.lock().await;
+    if state.web_generation.load(Ordering::SeqCst) != generation
+        || app.get_webview_window(WEB_LOGIN_WINDOW_LABEL).is_none()
+    {
+        return Ok(LoginStatus {
+            status: "webLoginCancelled",
+            message: "网页登录已取消".into(),
+            session_id: None,
+            qr_image: None,
+        });
+    }
+    *state.session.lock().await = Some(session);
     if let Some(w) = app.get_webview_window(WEB_LOGIN_WINDOW_LABEL) {
         w.close().ok();
     }
-
-    *state.session.lock().await = Some(session);
 
     Ok(LoginStatus {
         status: "success",
@@ -1145,6 +1201,12 @@ pub async fn check_web_login(
 }
 
 #[tauri::command]
-pub async fn cancel_web_login(app: tauri::AppHandle) -> Result<(), String> {
+pub async fn cancel_web_login(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, QLoginState>,
+) -> Result<(), String> {
+    // Only invalidate the currently open WebView attempt. An already committed session is retained.
+    let _commit = state.lifecycle_commit.lock().await;
+    state.web_generation.fetch_add(1, Ordering::SeqCst);
     clear_web_login_window(&app)
 }
