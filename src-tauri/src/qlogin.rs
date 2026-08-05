@@ -988,18 +988,32 @@ pub async fn get_qzone_login_user(
                 .headers()
                 .get(CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
-                .filter(|v| v.starts_with("image/"))
-                .unwrap_or("image/jpeg")
-                .to_owned();
+                .and_then(allowed_avatar_content_type);
+            let Some(content_type) = content_type else {
+                return Ok(QzoneLoginUser {
+                    uin: auth.uin,
+                    nickname,
+                    avatar_image: None,
+                });
+            };
             let mut response = response;
             let mut bytes = Vec::new();
             let mut valid = true;
-            while let Ok(Some(chunk)) = response.chunk().await {
-                if bytes.len().saturating_add(chunk.len()) > MAX_AVATAR_BYTES {
-                    valid = false;
-                    break;
+            loop {
+                match response.chunk().await {
+                    Ok(Some(chunk)) => {
+                        if bytes.len().saturating_add(chunk.len()) > MAX_AVATAR_BYTES {
+                            valid = false;
+                            break;
+                        }
+                        bytes.extend_from_slice(&chunk);
+                    }
+                    Ok(None) => break,
+                    Err(_) => {
+                        valid = false;
+                        break;
+                    }
                 }
-                bytes.extend_from_slice(&chunk);
             }
             valid.then(|| format!("data:{content_type};base64,{}", BASE64.encode(bytes)))
         }
@@ -1026,14 +1040,32 @@ fn clear_window_qq_cookies(window: &tauri::WebviewWindow) -> Result<(), String> 
     Ok(())
 }
 
+fn allowed_avatar_content_type(value: &str) -> Option<&'static str> {
+    let media_type = value.split(';').next()?.trim();
+    if media_type.eq_ignore_ascii_case("image/jpeg") {
+        Some("image/jpeg")
+    } else if media_type.eq_ignore_ascii_case("image/png") {
+        Some("image/png")
+    } else if media_type.eq_ignore_ascii_case("image/webp") {
+        Some("image/webp")
+    } else if media_type.eq_ignore_ascii_case("image/gif") {
+        Some("image/gif")
+    } else {
+        None
+    }
+}
+
 fn clear_web_login_window(app: &tauri::AppHandle) -> Result<(), String> {
     let Some(window) = app.get_webview_window(WEB_LOGIN_WINDOW_LABEL) else {
         return Ok(());
     };
-    clear_window_qq_cookies(&window)?;
-    window
-        .close()
-        .map_err(|_| "关闭 QQ 登录窗口失败".to_owned())
+    let cookies_cleared = clear_window_qq_cookies(&window).is_ok();
+    let window_closed = window.close().is_ok();
+    if cookies_cleared && window_closed {
+        Ok(())
+    } else {
+        Err("清理 QQ 登录状态失败".into())
+    }
 }
 
 #[tauri::command]
@@ -1061,13 +1093,16 @@ pub async fn open_web_login(
 ) -> Result<LoginStatus, String> {
     let _commit = state.lifecycle_commit.lock().await;
     if let Some(window) = app.get_webview_window(WEB_LOGIN_WINDOW_LABEL) {
-        window.set_focus().ok();
-        return Ok(LoginStatus {
-            status: "webLoginOpened",
-            message: "登录窗口已打开，请在窗口中完成 QQ 登录".into(),
-            session_id: None,
-            qr_image: None,
-        });
+        if state.active_web_attempt.load(Ordering::SeqCst) != 0 {
+            window.set_focus().ok();
+            return Ok(LoginStatus {
+                status: "webLoginOpened",
+                message: "登录窗口已打开，请在窗口中完成 QQ 登录".into(),
+                session_id: None,
+                qr_image: None,
+            });
+        }
+        window.close().ok();
     }
 
     let attempt = state.web_generation.fetch_add(1, Ordering::SeqCst) + 1;
