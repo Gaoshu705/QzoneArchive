@@ -344,11 +344,11 @@ async fn fetch_login_sig(client: &Client, user_agent: &str) -> Result<String, St
     if !response.status().is_success() {
         return Err(format!("xlogin 返回 HTTP {}", response.status()));
     }
-    response
+    let login_sig = response
         .cookies()
         .find(|cookie| cookie.name() == "pt_login_sig")
-        .map(|cookie| cookie.value().to_owned())
-        .ok_or_else(|| "xlogin 响应中缺少 pt_login_sig cookie".into())
+        .map(|cookie| cookie.value().to_owned());
+    login_sig.ok_or_else(|| "xlogin 响应中缺少 pt_login_sig cookie".into())
 }
 
 fn random_hex(len: usize) -> String {

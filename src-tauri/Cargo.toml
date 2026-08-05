@@ -33,3 +33,4 @@ reqwest = { version = "0.12", default-features = false, features = ["cookies", "
 tokio = { version = "1", features = ["sync", "time"] }
 cookie = "0.18"
 url = "2"
+uuid = { version = "1", features = ["v4"] }
