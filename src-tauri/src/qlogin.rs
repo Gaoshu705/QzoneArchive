@@ -488,10 +488,18 @@ pub async fn start_qr_login(state: tauri::State<'_, QLoginState>) -> Result<QrLo
         .entry(id.clone())
         .or_insert(0);
     let ua = state.next_mobile_user_agent().await;
-    let (session, image) = initialize_qr(ua, generation, epoch).await?;
+    let (session, image) = match initialize_qr(ua, generation, epoch).await {
+        Ok(value) => value,
+        Err(error) => {
+            state.cancel_epochs.lock().await.remove(&id);
+            return Err(error);
+        }
+    };
     let mut sessions = state.sessions.lock().await;
     sessions.retain(|_, value| unix_millis().saturating_sub(value.created_at) <= QR_SESSION_TTL_MS);
     if sessions.len() >= MAX_QR_SESSIONS {
+        drop(sessions);
+        state.cancel_epochs.lock().await.remove(&id);
         return Err("二维码登录会话过多，请稍后重试".into());
     }
     sessions.insert(id.clone(), session);
@@ -856,6 +864,9 @@ pub async fn cancel_qr_login(
     let removed = state.sessions.lock().await.remove(&id);
     if let Some(mut session) = removed {
         session.clear_secrets();
+    }
+    if !state.in_flight.lock().await.contains(&id) {
+        state.cancel_epochs.lock().await.remove(&id);
     }
     Ok(())
 }
