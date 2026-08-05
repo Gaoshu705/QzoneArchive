@@ -139,6 +139,7 @@ pub struct QLoginState {
     generation: AtomicU64,
     cancel_epochs: Mutex<HashMap<QrSessionId, u64>>,
     in_flight: Mutex<HashSet<QrSessionId>>,
+    lifecycle_commit: Mutex<()>,
 }
 
 pub(crate) struct QzoneAuth {
@@ -164,6 +165,7 @@ impl QLoginState {
             generation: AtomicU64::new(0),
             cancel_epochs: Mutex::new(HashMap::new()),
             in_flight: Mutex::new(HashSet::new()),
+            lifecycle_commit: Mutex::new(()),
         }
     }
 
@@ -199,6 +201,7 @@ impl QLoginState {
     }
 
     pub(crate) async fn clear_session(&self) {
+        let _commit = self.lifecycle_commit.lock().await;
         self.generation.fetch_add(1, Ordering::SeqCst);
         *self.session.lock().await = None;
         self.sessions.lock().await.clear();
@@ -320,17 +323,16 @@ fn parse_poll_callback(text: &str) -> Result<(String, String), String> {
 }
 
 fn validate_login_hop(url: &Url) -> bool {
-    url.scheme() == "https"
-        && matches!(
-            url.host_str(),
-            Some(
-                "ptlogin2.qzone.qq.com"
-                    | "ssl.ptlogin2.qq.com"
-                    | "ptlogin2.qq.com"
-                    | "qzone.qq.com"
-                    | "h5.qzone.qq.com"
-            )
-        )
+    if url.scheme() != "https" {
+        return false;
+    }
+    match url.host_str() {
+        Some("ptlogin2.qzone.qq.com" | "ssl.ptlogin2.qq.com" | "ptlogin2.qq.com") => true,
+        Some("qzone.qq.com" | "h5.qzone.qq.com") => {
+            matches!(url.path(), "/" | "/mqzone/index" | "/index")
+        }
+        _ => false,
+    }
 }
 
 fn validate_success_url(value: &str) -> Result<Url, String> {
@@ -801,6 +803,7 @@ async fn poll_inner(state: &QLoginState, id: QrSessionId) -> Result<LoginStatus,
                 s.clear_secrets();
                 return Ok(login_status(&id, "error", "登录身份校验失败", None));
             }
+            let _commit = state.lifecycle_commit.lock().await;
             if cancelled(state, &id, &s).await {
                 s.clear_secrets();
                 return Ok(login_status(&id, "cancelled", "二维码登录已取消", None));
@@ -831,6 +834,7 @@ pub async fn cancel_qr_login(
     state: tauri::State<'_, QLoginState>,
     id: QrSessionId,
 ) -> Result<(), String> {
+    let _commit = state.lifecycle_commit.lock().await;
     {
         let mut epochs = state.cancel_epochs.lock().await;
         *epochs.entry(id.clone()).or_insert(0) += 1;
