@@ -33,9 +33,9 @@ export const useAuthStore = defineStore("auth", () => {
     if (id) await invoke("cancel_qr_login", { id }).catch(() => {});
   }
   async function closeLogin() {
-    dialogVisible.value = false; pollingRun += 1;
-    await Promise.all([cancelQrSession(), webLoginMode.value ? cancelWebLoginCommand().catch(() => {}) : Promise.resolve()]);
-    webLoginMode.value = false;
+    dialogVisible.value = false;
+    if (webLoginMode.value) { await cancelWebLogin(); return; }
+    pollingRun += 1; await cancelQrSession();
   }
   async function refreshQrCode() {
     const run = ++pollingRun; await cancelQrSession(); loading.value = true; qrImage.value = ""; status.value = "waiting"; message.value = "正在获取登录二维码…";
