@@ -135,7 +135,7 @@ pub struct QLoginState {
     in_flight: Mutex<HashSet<QrSessionId>>,
     lifecycle_commit: Mutex<()>,
     web_generation: AtomicU64,
-    web_attempt: Mutex<Option<u64>>,
+    active_web_attempt: AtomicU64,
 }
 
 pub(crate) struct QzoneAuth {
@@ -163,7 +163,7 @@ impl QLoginState {
             in_flight: Mutex::new(HashSet::new()),
             lifecycle_commit: Mutex::new(()),
             web_generation: AtomicU64::new(0),
-            web_attempt: Mutex::new(None),
+            active_web_attempt: AtomicU64::new(0),
         }
     }
 
@@ -202,7 +202,7 @@ impl QLoginState {
         let _commit = self.lifecycle_commit.lock().await;
         self.generation.fetch_add(1, Ordering::SeqCst);
         self.web_generation.fetch_add(1, Ordering::SeqCst);
-        *self.web_attempt.lock().await = None;
+        self.active_web_attempt.store(0, Ordering::SeqCst);
         *self.session.lock().await = None;
         self.sessions.lock().await.clear();
         self.cancel_epochs.lock().await.clear();
@@ -1071,7 +1071,7 @@ pub async fn open_web_login(
     }
 
     let attempt = state.web_generation.fetch_add(1, Ordering::SeqCst) + 1;
-    *state.web_attempt.lock().await = Some(attempt);
+    state.active_web_attempt.store(attempt, Ordering::SeqCst);
     let builder = WebviewWindowBuilder::new(
         &app,
         WEB_LOGIN_WINDOW_LABEL,
@@ -1102,14 +1102,15 @@ pub async fn check_web_login(
     app: tauri::AppHandle,
     state: tauri::State<'_, QLoginState>,
 ) -> Result<LoginStatus, String> {
-    let Some(generation) = *state.web_attempt.lock().await else {
+    let generation = state.active_web_attempt.load(Ordering::SeqCst);
+    if generation == 0 {
         return Ok(LoginStatus {
             status: "webLoginCancelled",
             message: "网页登录已取消".into(),
             session_id: None,
             qr_image: None,
         });
-    };
+    }
     let Some(window) = app.get_webview_window(WEB_LOGIN_WINDOW_LABEL) else {
         return Ok(LoginStatus {
             status: "webLoginCancelled",
@@ -1186,7 +1187,7 @@ pub async fn check_web_login(
     };
 
     let _commit = state.lifecycle_commit.lock().await;
-    if *state.web_attempt.lock().await != Some(generation)
+    if state.active_web_attempt.load(Ordering::SeqCst) != generation
         || app.get_webview_window(WEB_LOGIN_WINDOW_LABEL).is_none()
     {
         return Ok(LoginStatus {
@@ -1197,7 +1198,7 @@ pub async fn check_web_login(
         });
     }
     *state.session.lock().await = Some(session);
-    *state.web_attempt.lock().await = None;
+    state.active_web_attempt.store(0, Ordering::SeqCst);
     if let Some(w) = app.get_webview_window(WEB_LOGIN_WINDOW_LABEL) {
         w.close().ok();
     }
@@ -1217,8 +1218,11 @@ pub async fn cancel_web_login(
 ) -> Result<(), String> {
     // Invalidate only the current WebView attempt. If its check committed while cancel
     // waited for the lifecycle lock, revoke that attempt's session but retain older auth.
+    // Capture and invalidate the active attempt before waiting for a concurrent commit.
+    // This value is the queued cancel target and survives check clearing the active slot.
+    let captured = state.active_web_attempt.swap(0, Ordering::SeqCst);
+    let attempt = (captured != 0).then_some(captured);
     let _commit = state.lifecycle_commit.lock().await;
-    let attempt = state.web_attempt.lock().await.take();
     state.web_generation.fetch_add(1, Ordering::SeqCst);
     let mut session = state.session.lock().await;
     if attempt.is_some()
