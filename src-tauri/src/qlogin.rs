@@ -1197,6 +1197,7 @@ pub async fn check_web_login(
         });
     }
     *state.session.lock().await = Some(session);
+    *state.web_attempt.lock().await = None;
     if let Some(w) = app.get_webview_window(WEB_LOGIN_WINDOW_LABEL) {
         w.close().ok();
     }
