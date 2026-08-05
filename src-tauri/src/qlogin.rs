@@ -8,10 +8,11 @@ use std::{
 };
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use encoding_rs::GB18030;
 use regex::Regex;
 use reqwest::{
     cookie::{CookieStore, Jar},
-    header::{LOCATION, USER_AGENT},
+    header::{CONTENT_TYPE, LOCATION, REFERER, USER_AGENT},
     redirect::Policy,
     Client,
 };
@@ -41,6 +42,16 @@ const MAX_POLLS: u32 = 180;
 const MAX_REFRESHES: u32 = 3;
 const WEB_LOGIN_URL: &str = "https://i.qq.com";
 const WEB_LOGIN_WINDOW_LABEL: &str = "qq-web-login";
+const MAX_AVATAR_BYTES: usize = 2 * 1024 * 1024;
+const REQUIRED_WEB_COOKIES: &[&str] = &["uin", "p_uin", "p_skey", "skey", "pt4_token"];
+const ALLOWED_WEB_COOKIE_DOMAINS: &[&str] = &[
+    "qq.com",
+    ".qq.com",
+    "i.qq.com",
+    ".i.qq.com",
+    "qzone.qq.com",
+    ".qzone.qq.com",
+];
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -201,6 +212,22 @@ impl QLoginState {
 pub struct QrLoginStart {
     session_id: QrSessionId,
     qr_image: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QzoneLoginUser {
+    uin: String,
+    nickname: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    avatar_image: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct UserInfoResponse {
+    code: i64,
+    message: Option<String>,
+    data: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 #[derive(Serialize)]
@@ -837,10 +864,152 @@ pub async fn get_login_status(state: tauri::State<'_, QLoginState>) -> Result<Lo
     })
 }
 
+fn decode_legacy_text(bytes: &[u8]) -> String {
+    String::from_utf8(bytes.to_vec()).unwrap_or_else(|_| GB18030.decode(bytes).0.into_owned())
+}
+
+fn parse_user_info(text: &str) -> Result<(String, Option<String>), String> {
+    let start = text.find('{').ok_or("用户资料响应格式不正确")?;
+    let end = text
+        .rfind('}')
+        .filter(|end| *end >= start)
+        .ok_or("用户资料响应格式不正确")?;
+    let response: UserInfoResponse =
+        serde_json::from_str(&text[start..=end]).map_err(|_| "用户资料响应格式不正确")?;
+    if response.code != 0 {
+        return Err(response
+            .message
+            .unwrap_or_else(|| "QQ 用户资料接口返回错误".into()));
+    }
+    let data = response.data.ok_or("QQ 用户资料接口未返回资料")?;
+    let value = |names: &[&str]| {
+        names
+            .iter()
+            .find_map(|name| data.get(*name))
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+    };
+    Ok((
+        value(&["nickname", "nick", "name"]).unwrap_or_else(|| "QQ 用户".into()),
+        value(&["avatar", "face"]),
+    ))
+}
+
+async fn request_user_info(
+    state: &QLoginState,
+    auth: &QzoneAuth,
+    url: Url,
+) -> Result<(String, Option<String>), String> {
+    let response = state
+        .client()
+        .get(url)
+        .header(USER_AGENT, &auth.user_agent)
+        .header(REFERER, format!("https://user.qzone.qq.com/{}", auth.uin))
+        .header(reqwest::header::COOKIE, &auth.cookie_header)
+        .send()
+        .await
+        .map_err(|_| "获取 QQ 用户资料失败")?;
+    if !response.status().is_success() {
+        return Err("QQ 用户资料接口暂时不可用".into());
+    }
+    let bytes = response.bytes().await.map_err(|_| "读取 QQ 用户资料失败")?;
+    parse_user_info(&decode_legacy_text(&bytes))
+}
+
 #[tauri::command]
-pub async fn logout_qzone(state: tauri::State<'_, QLoginState>) -> Result<(), String> {
+pub async fn get_qzone_login_user(
+    state: tauri::State<'_, QLoginState>,
+) -> Result<QzoneLoginUser, String> {
+    let auth = state.qzone_auth().await?;
+    let mut vip = Url::parse(
+        "https://h5.qzone.qq.com/proxy/domain/vip.qzone.qq.com/fcg-bin/fcg_get_vipinfo_mobile",
+    )
+    .map_err(|_| "用户资料地址无效")?;
+    vip.query_pairs_mut()
+        .append_pair("get_all", "1")
+        .append_pair("uin", &auth.uin)
+        .append_pair("g_tk", &auth.g_tk.to_string());
+    let (nickname, avatar) = match request_user_info(&state, &auth, vip).await {
+        Ok(value) => value,
+        Err(_) => {
+            let mut legacy = Url::parse("https://h5.qzone.qq.com/proxy/domain/base.qzone.qq.com/cgi-bin/user/cgi_userinfo_get_all").map_err(|_| "用户资料地址无效")?;
+            legacy
+                .query_pairs_mut()
+                .append_pair("uin", &auth.uin)
+                .append_pair("vuin", &auth.uin)
+                .append_pair("fupdate", "1")
+                .append_pair("g_tk", &auth.g_tk.to_string());
+            request_user_info(&state, &auth, legacy).await?
+        }
+    };
+    let avatar_url =
+        avatar.unwrap_or_else(|| format!("https://q1.qlogo.cn/g?b=qq&nk={}&s=100", auth.uin));
+    let avatar_image = match state
+        .client()
+        .get(avatar_url)
+        .header(USER_AGENT, &auth.user_agent)
+        .header(reqwest::header::COOKIE, &auth.cookie_header)
+        .send()
+        .await
+    {
+        Ok(response)
+            if response.status().is_success()
+                && response
+                    .content_length()
+                    .is_none_or(|n| n <= MAX_AVATAR_BYTES as u64) =>
+        {
+            let content_type = response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .filter(|v| v.starts_with("image/"))
+                .unwrap_or("image/jpeg")
+                .to_owned();
+            response
+                .bytes()
+                .await
+                .ok()
+                .filter(|b| b.len() <= MAX_AVATAR_BYTES)
+                .map(|b| format!("data:{content_type};base64,{}", BASE64.encode(b)))
+        }
+        _ => None,
+    };
+    Ok(QzoneLoginUser {
+        uin: auth.uin,
+        nickname,
+        avatar_image,
+    })
+}
+
+fn clear_web_login_window(app: &tauri::AppHandle) -> Result<(), String> {
+    let Some(window) = app.get_webview_window(WEB_LOGIN_WINDOW_LABEL) else {
+        return Ok(());
+    };
+    let cookies = window
+        .cookies()
+        .map_err(|_| "读取 QQ 登录窗口 Cookie 失败")?;
+    for cookie in cookies {
+        if cookie
+            .domain()
+            .is_some_and(|domain| ALLOWED_WEB_COOKIE_DOMAINS.contains(&domain))
+        {
+            window
+                .delete_cookie(cookie)
+                .map_err(|_| "清理 QQ 登录窗口 Cookie 失败")?;
+        }
+    }
+    window
+        .close()
+        .map_err(|_| "关闭 QQ 登录窗口失败".to_owned())
+}
+
+#[tauri::command]
+pub async fn logout_qzone(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, QLoginState>,
+) -> Result<(), String> {
     state.clear_session().await;
-    Ok(())
+    clear_web_login_window(&app)
 }
 
 #[tauri::command]
@@ -906,14 +1075,25 @@ pub async fn check_web_login(
 
     let mut cookie_map: HashMap<String, String> = HashMap::new();
     for c in &cookies {
-        cookie_map.insert(c.name().to_string(), c.value().to_string());
+        if REQUIRED_WEB_COOKIES.contains(&c.name()) && !c.value().trim().is_empty() {
+            cookie_map.insert(c.name().to_string(), c.value().to_string());
+        }
     }
-    // Fallback: merge all_cookies if url-scoped didn't get p_skey
+    // URL-scoped extraction is preferred. The fallback accepts only explicitly required
+    // credentials from known QQ domains, never the WebView's complete cookie collection.
     if cookie_map.get("p_skey").is_none_or(|v| v.is_empty()) {
         for c in &all_cookies {
-            cookie_map
-                .entry(c.name().to_string())
-                .or_insert_with(|| c.value().to_string());
+            let allowed_domain = c
+                .domain()
+                .is_some_and(|domain| ALLOWED_WEB_COOKIE_DOMAINS.contains(&domain));
+            if allowed_domain
+                && REQUIRED_WEB_COOKIES.contains(&c.name())
+                && !c.value().trim().is_empty()
+            {
+                cookie_map
+                    .entry(c.name().to_string())
+                    .or_insert_with(|| c.value().to_string());
+            }
         }
     }
 
@@ -934,10 +1114,7 @@ pub async fn check_web_login(
         .or_else(|| cookie_map.get("p_uin"))
         .filter(|v| !v.is_empty())
         .cloned()
-        .ok_or_else(|| {
-            let available = cookie_map.keys().cloned().collect::<Vec<_>>().join(", ");
-            format!("登录 Cookie 不完整：缺少 uin（当前可用 Cookie：{available}）")
-        })?;
+        .ok_or("登录 Cookie 不完整：缺少账号标识")?;
 
     let g_tk = bkn(&p_skey);
     let user_agent = account_user_agent(&uin);
@@ -964,23 +1141,6 @@ pub async fn check_web_login(
 }
 
 #[tauri::command]
-pub async fn sync_cookies_to_webview(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, QLoginState>,
-) -> Result<(), String> {
-    let guard = state.session.lock().await;
-    let session = guard.as_ref().ok_or("尚未登录，无法同步 Cookie")?;
-    let Some(main_window) = app.get_webview_window("main") else {
-        return Ok(()); // 没有主窗口则跳过
-    };
-    for (name, value) in &session.cookies {
-        if value.trim().is_empty() {
-            continue;
-        }
-        let cookie_str = format!("{name}={value}; Domain=.qq.com; Path=/");
-        if let Ok(c) = cookie_str.parse::<cookie::Cookie>() {
-            main_window.set_cookie(c).ok();
-        }
-    }
-    Ok(())
+pub async fn cancel_web_login(app: tauri::AppHandle) -> Result<(), String> {
+    clear_web_login_window(&app)
 }

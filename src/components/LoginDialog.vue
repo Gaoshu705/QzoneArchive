@@ -33,7 +33,7 @@ const showWebLogin = computed(() => platform() !== "android");
         <span class="status-dot" />
         <p>{{ message }}</p>
       </div>
-      <p class="login-help">在新窗口中完成 QQ 登录后，登录凭证将自动同步到本软件。</p>
+      <p class="login-help">在新窗口中完成登录后，凭证仅保存在本机 Rust 后端，页面只接收公开用户资料。</p>
       <div class="login-actions">
         <Button
           v-if="status === 'webLoginWaiting' || status === 'webLoginOpened'"
@@ -65,7 +65,7 @@ const showWebLogin = computed(() => platform() !== "android");
         <span class="status-dot" />
         <p>{{ message }}</p>
       </div>
-      <p class="login-help">二维码和登录凭证仅由本机 Rust 后端处理，不会暴露给页面脚本。</p>
+      <p class="login-help">二维码登录与凭证由本机 Rust 后端处理，页面只接收二维码和公开用户资料。</p>
       <Button v-if="status === 'expired' || status === 'error'" label="刷新二维码" icon="pi pi-refresh" :loading="loading" @click="authStore.refreshQrCode" />
       <div v-if="showWebLogin" class="login-alt">
         <Button
