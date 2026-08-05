@@ -42,6 +42,9 @@ const MAX_POLLS: u32 = 180;
 const MAX_REFRESHES: u32 = 3;
 const WEB_LOGIN_URL: &str = "https://i.qq.com";
 const WEB_LOGIN_WINDOW_LABEL: &str = "qq-web-login";
+const WEB_LOGIN_OPEN_ERROR: &str = "无法打开 QQ 登录窗口，请稍后重试";
+const WEB_LOGIN_CLOSE_POLL_ATTEMPTS: usize = 20;
+const WEB_LOGIN_CLOSE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
 const MAX_PROFILE_BYTES: usize = 256 * 1024;
 const MAX_AVATAR_BYTES: usize = 2 * 1024 * 1024;
 const REQUIRED_WEB_COOKIES: &[&str] = &["uin", "p_uin", "p_skey", "skey", "pt4_token"];
@@ -134,6 +137,7 @@ pub struct QLoginState {
     cancel_epochs: Mutex<HashMap<QrSessionId, u64>>,
     in_flight: Mutex<HashSet<QrSessionId>>,
     lifecycle_commit: Mutex<()>,
+    web_open: Mutex<()>,
     web_generation: AtomicU64,
     active_web_attempt: AtomicU64,
 }
@@ -162,6 +166,7 @@ impl QLoginState {
             cancel_epochs: Mutex::new(HashMap::new()),
             in_flight: Mutex::new(HashSet::new()),
             lifecycle_commit: Mutex::new(()),
+            web_open: Mutex::new(()),
             web_generation: AtomicU64::new(0),
             active_web_attempt: AtomicU64::new(0),
         }
@@ -1091,30 +1096,47 @@ pub async fn open_web_login(
     app: tauri::AppHandle,
     state: tauri::State<'_, QLoginState>,
 ) -> Result<LoginStatus, String> {
-    let _commit = state.lifecycle_commit.lock().await;
-    if let Some(window) = app.get_webview_window(WEB_LOGIN_WINDOW_LABEL) {
-        if state.active_web_attempt.load(Ordering::SeqCst) != 0 {
-            window.set_focus().ok();
-            return Ok(LoginStatus {
-                status: "webLoginOpened",
-                message: "登录窗口已打开，请在窗口中完成 QQ 登录".into(),
-                session_id: None,
-                qr_image: None,
-            });
+    // Serialize the whole replacement flow without holding the lifecycle lock while waiting
+    // for Tauri to release a closed window's label.
+    let _open = state.web_open.lock().await;
+    {
+        let _commit = state.lifecycle_commit.lock().await;
+        if let Some(window) = app.get_webview_window(WEB_LOGIN_WINDOW_LABEL) {
+            if state.active_web_attempt.load(Ordering::SeqCst) != 0 {
+                window.set_focus().ok();
+                return Ok(LoginStatus {
+                    status: "webLoginOpened",
+                    message: "登录窗口已打开，请在窗口中完成 QQ 登录".into(),
+                    session_id: None,
+                    qr_image: None,
+                });
+            }
+            window
+                .close()
+                .map_err(|_| WEB_LOGIN_OPEN_ERROR.to_owned())?;
         }
-        window.close().ok();
     }
 
-    let attempt = state.web_generation.fetch_add(1, Ordering::SeqCst) + 1;
-    state.active_web_attempt.store(attempt, Ordering::SeqCst);
+    for _ in 0..WEB_LOGIN_CLOSE_POLL_ATTEMPTS {
+        if app.get_webview_window(WEB_LOGIN_WINDOW_LABEL).is_none() {
+            break;
+        }
+        tokio::time::sleep(WEB_LOGIN_CLOSE_POLL_INTERVAL).await;
+    }
+
+    let _commit = state.lifecycle_commit.lock().await;
+    if app.get_webview_window(WEB_LOGIN_WINDOW_LABEL).is_some() {
+        state.active_web_attempt.store(0, Ordering::SeqCst);
+        return Err(WEB_LOGIN_OPEN_ERROR.into());
+    }
+
+    let login_url = WEB_LOGIN_URL
+        .parse::<Url>()
+        .map_err(|_| WEB_LOGIN_OPEN_ERROR.to_owned())?;
     let builder = WebviewWindowBuilder::new(
         &app,
         WEB_LOGIN_WINDOW_LABEL,
-        WebviewUrl::External(
-            WEB_LOGIN_URL
-                .parse::<Url>()
-                .map_err(|e| format!("登录地址无效: {e}"))?,
-        ),
+        WebviewUrl::External(login_url),
     )
     .title("QQ 账号登录")
     .inner_size(800.0, 720.0);
@@ -1122,8 +1144,10 @@ pub async fn open_web_login(
     let builder = builder.center();
     builder
         .build()
-        .map_err(|e| format!("创建登录窗口失败: {e}"))?;
+        .map_err(|_| WEB_LOGIN_OPEN_ERROR.to_owned())?;
 
+    let attempt = state.web_generation.fetch_add(1, Ordering::SeqCst) + 1;
+    state.active_web_attempt.store(attempt, Ordering::SeqCst);
     Ok(LoginStatus {
         status: "webLoginOpened",
         message: "请在打开的窗口中完成 QQ 登录".into(),
