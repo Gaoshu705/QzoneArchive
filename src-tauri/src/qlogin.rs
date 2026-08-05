@@ -11,7 +11,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use regex::Regex;
 use reqwest::{
     cookie::{CookieStore, Jar},
-    header::USER_AGENT,
+    header::{LOCATION, USER_AGENT},
     redirect::Policy,
     Client,
 };
@@ -191,6 +191,8 @@ impl QLoginState {
         self.generation.fetch_add(1, Ordering::SeqCst);
         *self.session.lock().await = None;
         self.sessions.lock().await.clear();
+        self.cancel_epochs.lock().await.clear();
+        self.in_flight.lock().await.clear();
     }
 }
 
@@ -290,6 +292,20 @@ fn parse_poll_callback(text: &str) -> Result<(String, String), String> {
     Ok((captures[1].to_owned(), captures[3].to_owned()))
 }
 
+fn validate_login_hop(url: &Url) -> bool {
+    url.scheme() == "https"
+        && matches!(
+            url.host_str(),
+            Some(
+                "ptlogin2.qzone.qq.com"
+                    | "ssl.ptlogin2.qq.com"
+                    | "ptlogin2.qq.com"
+                    | "qzone.qq.com"
+                    | "h5.qzone.qq.com"
+            )
+        )
+}
+
 fn validate_success_url(value: &str) -> Result<Url, String> {
     let url = Url::parse(value).map_err(|_| "登录跳转地址无效")?;
     let allowed = matches!(
@@ -327,7 +343,7 @@ async fn initialize_qr(
     let jar = Arc::new(Jar::default());
     let client = Client::builder()
         .cookie_provider(jar.clone())
-        .redirect(Policy::limited(5))
+        .redirect(Policy::none())
         .connect_timeout(std::time::Duration::from_secs(15))
         .timeout(std::time::Duration::from_secs(35))
         .build()
@@ -414,6 +430,13 @@ async fn initialize_qr(
 
 #[tauri::command]
 pub async fn start_qr_login(state: tauri::State<'_, QLoginState>) -> Result<QrLoginStart, String> {
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.retain(|_, v| unix_millis().saturating_sub(v.created_at) <= QR_SESSION_TTL_MS);
+        if sessions.len() >= MAX_QR_SESSIONS {
+            return Err("二维码登录会话过多，请稍后重试".into());
+        }
+    }
     let id = QrSessionId::generate();
     let generation = state.generation.load(Ordering::SeqCst);
     let epoch = *state
@@ -425,7 +448,7 @@ pub async fn start_qr_login(state: tauri::State<'_, QLoginState>) -> Result<QrLo
     let ua = state.next_mobile_user_agent().await;
     let (session, image) = initialize_qr(ua, generation, epoch).await?;
     let mut sessions = state.sessions.lock().await;
-    sessions.retain(|_, v| unix_millis().saturating_sub(v.created_at) <= QR_SESSION_TTL_MS);
+    sessions.retain(|_, value| unix_millis().saturating_sub(value.created_at) <= QR_SESSION_TTL_MS);
     if sessions.len() >= MAX_QR_SESSIONS {
         return Err("二维码登录会话过多，请稍后重试".into());
     }
@@ -479,6 +502,9 @@ pub async fn poll_qr_login(
     }
     let r = poll_inner(&state, id.clone()).await;
     state.in_flight.lock().await.remove(&id);
+    if !state.sessions.lock().await.contains_key(&id) {
+        state.cancel_epochs.lock().await.remove(&id);
+    }
     r
 }
 async fn poll_inner(state: &QLoginState, id: QrSessionId) -> Result<LoginStatus, String> {
@@ -589,6 +615,7 @@ async fn poll_inner(state: &QLoginState, id: QrSessionId) -> Result<LoginStatus,
                 ("pt_3rd_aid", "0"),
                 ("u1", s.u1),
             ]);
+            let old_sig = jar_cookies(&s.jar, &q).get("qrsig").cloned();
             let r = match s
                 .client
                 .get(q.clone())
@@ -607,11 +634,46 @@ async fn poll_inner(state: &QLoginState, id: QrSessionId) -> Result<LoginStatus,
                     ));
                 }
             };
-            let sig = jar_cookies(&s.jar, &q)
-                .get("qrsig")
-                .cloned()
-                .ok_or("二维码刷新响应不完整")?;
-            let image = r.bytes().await.map_err(|_| "读取刷新二维码失败")?;
+            if !r.status().is_success() {
+                if cancelled(state, &id, &s).await {
+                    s.clear_secrets();
+                } else {
+                    restore(state, id.clone(), s).await;
+                }
+                return Ok(login_status(
+                    &id,
+                    "error",
+                    "刷新二维码失败，请稍后重试",
+                    None,
+                ));
+            }
+            let response_sig = r
+                .cookies()
+                .find(|cookie| cookie.name() == "qrsig" && !cookie.value().is_empty())
+                .map(|cookie| cookie.value().to_owned());
+            let sig = match response_sig.filter(|value| old_sig.as_ref() != Some(value)) {
+                Some(value) => value,
+                None => {
+                    s.clear_secrets();
+                    return Ok(login_status(&id, "error", "二维码刷新响应不完整", None));
+                }
+            };
+            let image = match r.bytes().await {
+                Ok(image) => image,
+                Err(_) => {
+                    if cancelled(state, &id, &s).await {
+                        s.clear_secrets();
+                    } else {
+                        restore(state, id.clone(), s).await;
+                    }
+                    return Ok(login_status(
+                        &id,
+                        "error",
+                        "读取刷新二维码失败，请稍后重试",
+                        None,
+                    ));
+                }
+            };
             s.ptqrtoken = ptqr_token(&sig);
             s.refresh_count += 1;
             if cancelled(state, &id, &s).await {
@@ -627,31 +689,67 @@ async fn poll_inner(state: &QLoginState, id: QrSessionId) -> Result<LoginStatus,
             ))
         }
         "0" => {
-            let u = validate_success_url(&url)?;
+            let mut u = match validate_success_url(&url) {
+                Ok(url) => url,
+                Err(_) => {
+                    s.clear_secrets();
+                    return Ok(login_status(&id, "error", "登录跳转校验失败", None));
+                }
+            };
             let callback = u
                 .query_pairs()
                 .find(|(k, _)| k == "uin")
                 .map(|(_, v)| normalized_uin(&v))
                 .ok_or("登录响应不完整")?;
-            let r = match s
-                .client
-                .get(u)
-                .header(USER_AGENT, &s.user_agent)
-                .send()
-                .await
-            {
-                Ok(v) => v,
-                Err(_) => {
-                    restore(state, id.clone(), s).await;
-                    return Ok(login_status(
-                        &id,
-                        "error",
-                        "确认 QQ 登录失败，请稍后重试",
-                        None,
-                    ));
+            let mut final_status = None;
+            for _ in 0..=5 {
+                if !validate_login_hop(&u) {
+                    s.clear_secrets();
+                    return Ok(login_status(&id, "error", "登录跳转校验失败", None));
                 }
-            };
-            if !r.status().is_success() && !r.status().is_redirection() {
+                let r = match s
+                    .client
+                    .get(u.clone())
+                    .header(USER_AGENT, &s.user_agent)
+                    .send()
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(_) => {
+                        restore(state, id.clone(), s).await;
+                        return Ok(login_status(
+                            &id,
+                            "error",
+                            "确认 QQ 登录失败，请稍后重试",
+                            None,
+                        ));
+                    }
+                };
+                if r.status().is_redirection() {
+                    let location = match r
+                        .headers()
+                        .get(LOCATION)
+                        .and_then(|value| value.to_str().ok())
+                    {
+                        Some(location) => location,
+                        None => {
+                            s.clear_secrets();
+                            return Ok(login_status(&id, "error", "登录跳转响应不完整", None));
+                        }
+                    };
+                    u = match u.join(location) {
+                        Ok(next) if validate_login_hop(&next) => next,
+                        _ => {
+                            s.clear_secrets();
+                            return Ok(login_status(&id, "error", "登录跳转校验失败", None));
+                        }
+                    };
+                    continue;
+                }
+                final_status = Some(r.status());
+                break;
+            }
+            if final_status.is_none_or(|status| !status.is_success()) {
                 s.clear_secrets();
                 return Ok(login_status(&id, "error", "确认 QQ 登录失败", None));
             }
@@ -660,16 +758,18 @@ async fn poll_inner(state: &QLoginState, id: QrSessionId) -> Result<LoginStatus,
                 return Ok(login_status(&id, "cancelled", "二维码登录已取消", None));
             }
             let c = jar_cookies(&s.jar, &Url::parse("https://qzone.qq.com/").unwrap());
-            let cu = c
+            let Some(cu) = c
                 .get("uin")
                 .or_else(|| c.get("p_uin"))
                 .map(|v| normalized_uin(v))
-                .ok_or("登录凭据不完整")?;
-            let key = c
-                .get("p_skey")
-                .filter(|v| !v.is_empty())
-                .cloned()
-                .ok_or("登录凭据不完整")?;
+            else {
+                s.clear_secrets();
+                return Ok(login_status(&id, "error", "登录凭据不完整", None));
+            };
+            let Some(key) = c.get("p_skey").filter(|v| !v.is_empty()).cloned() else {
+                s.clear_secrets();
+                return Ok(login_status(&id, "error", "登录凭据不完整", None));
+            };
             if cu != callback {
                 s.clear_secrets();
                 return Ok(login_status(&id, "error", "登录身份校验失败", None));
@@ -704,10 +804,13 @@ pub async fn cancel_qr_login(
     state: tauri::State<'_, QLoginState>,
     id: QrSessionId,
 ) -> Result<(), String> {
-    let mut e = state.cancel_epochs.lock().await;
-    *e.entry(id.clone()).or_insert(0) += 1;
-    if let Some(mut s) = state.sessions.lock().await.remove(&id) {
-        s.clear_secrets();
+    {
+        let mut epochs = state.cancel_epochs.lock().await;
+        *epochs.entry(id.clone()).or_insert(0) += 1;
+    }
+    let removed = state.sessions.lock().await.remove(&id);
+    if let Some(mut session) = removed {
+        session.clear_secrets();
     }
     Ok(())
 }
