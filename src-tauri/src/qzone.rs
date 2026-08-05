@@ -70,6 +70,7 @@ fn response_headers(headers: &reqwest::header::HeaderMap) -> Vec<Value> {
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn log_feed_request_error(
     stage: &str,
     request_url: &str,
@@ -90,7 +91,7 @@ fn log_feed_request_error(
         (_, Some(value)) => Some(value),
         (Some(text), None) => Some(json!({
             "format": "raw",
-            "bytesReceived": text.as_bytes().len(),
+            "bytesReceived": text.len(),
             "content": "非完整 JSON 或非 JSON 响应，原始正文见本诊断块下方"
         })),
         (None, None) => None,
