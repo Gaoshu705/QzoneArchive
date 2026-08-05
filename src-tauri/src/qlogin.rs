@@ -11,13 +11,16 @@ use reqwest::{
     redirect::Policy,
     Client, Response,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 use tokio::sync::Mutex;
 use url::Url;
 
 const APP_ID: &str = "549000929";
 const DAID: &str = "5";
+const XLOGIN_URL: &str = "https://xui.ptlogin2.qq.com/cgi-bin/xlogin";
+const S_URL: &str = "https://h5.qzone.qq.com/mqzone/index";
+const PROXY_URL: &str = "";
 const MOBILE_USER_AGENTS: &[&str] = &[
     "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1",
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1",
@@ -31,9 +34,65 @@ static USER_AGENT_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 const WEB_LOGIN_URL: &str = "https://i.qq.com";
 const WEB_LOGIN_WINDOW_LABEL: &str = "qq-web-login";
 
-const XLOGIN_URL: &str = "https://xui.ptlogin2.qq.com/cgi-bin/xlogin";
-const S_URL: &str = "https://h5.qzone.qq.com/mqzone/index";
-const PROXY_URL: &str = "";
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct QrSessionId(String);
+
+impl QrSessionId {
+    fn generate() -> Self {
+        Self(uuid::Uuid::new_v4().simple().to_string())
+    }
+}
+
+impl From<&str> for QrSessionId {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+
+#[derive(Clone, Debug)]
+struct QrLoginSession {
+    created_at: u128,
+    refresh_count: u32,
+    poll_count: u32,
+    cancelled: bool,
+    cookies: HashMap<String, String>,
+    user_agent: String,
+    appid: &'static str,
+    u1: &'static str,
+    ptqrtoken: i64,
+    login_sig: String,
+    uin: Option<String>,
+    g_tk: Option<i64>,
+}
+
+impl QrLoginSession {
+    fn new(cookies: HashMap<String, String>, user_agent: String) -> Self {
+        Self {
+            created_at: unix_millis(),
+            refresh_count: 0,
+            poll_count: 0,
+            cancelled: false,
+            cookies,
+            user_agent,
+            appid: APP_ID,
+            u1: S_URL,
+            ptqrtoken: 0,
+            login_sig: String::new(),
+            uin: None,
+            g_tk: None,
+        }
+    }
+
+    fn clear_secrets(&mut self) {
+        self.cookies.clear();
+        self.user_agent.clear();
+        self.ptqrtoken = 0;
+        self.login_sig.clear();
+        self.uin = None;
+        self.g_tk = None;
+    }
+}
 
 #[derive(Default)]
 struct LoginSession {
@@ -42,12 +101,12 @@ struct LoginSession {
     uin: Option<String>,
     g_tk: Option<i64>,
     user_agent: String,
-    login_sig: String,
 }
 
 pub struct QLoginState {
     client: Client,
     session: Mutex<Option<LoginSession>>,
+    sessions: Mutex<HashMap<QrSessionId, QrLoginSession>>,
     last_user_agent: Mutex<Option<String>>,
 }
 
@@ -69,6 +128,7 @@ impl QLoginState {
         Self {
             client,
             session: Mutex::new(None),
+            sessions: Mutex::new(HashMap::new()),
             last_user_agent: Mutex::new(None),
         }
     }
@@ -104,32 +164,37 @@ impl QLoginState {
         selected
     }
 
+    async fn qr_session(&self, session_id: &QrSessionId) -> Result<QrLoginSession, String> {
+        self.sessions
+            .lock()
+            .await
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| "二维码登录会话不存在或已失效".to_owned())
+    }
+
     pub(crate) async fn clear_session(&self) {
         *self.session.lock().await = None;
+        self.sessions.lock().await.clear();
     }
 }
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QrLoginStart {
+    session_id: QrSessionId,
     qr_image: String,
-}
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LoginCredentials {
-    uin: String,
-    g_tk: i64,
-    cookies: HashMap<String, String>,
-    user_agent: String,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoginStatus {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<QrSessionId>,
     status: &'static str,
     message: String,
-    auth: Option<LoginCredentials>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    qr_image: Option<String>,
 }
 
 fn unix_millis() -> u128 {
@@ -137,20 +202,6 @@ fn unix_millis() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
-}
-
-fn random_hex(len: usize) -> String {
-    let seed = unix_millis() ^ (USER_AGENT_SEQUENCE.load(Ordering::Relaxed) as u128);
-    let mut state = seed.wrapping_mul(0x9E37_79B9);
-    let mut result = String::with_capacity(len);
-    for _ in 0..len {
-        state = state
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1_442_695_040_888_963_407);
-        let digit = ((state >> 32) & 0xF) as u8;
-        result.push(char::from_digit(digit as u32, 16).unwrap_or('0'));
-    }
-    result
 }
 
 fn select_mobile_user_agent(previous: Option<&str>) -> String {
@@ -204,7 +255,6 @@ mod tests {
     use super::{
         bkn, callback_query_value, ptqr_token, select_mobile_user_agent, MOBILE_USER_AGENTS,
     };
-
     #[test]
     fn login_hashes_match_reference_algorithm() {
         assert_eq!(ptqr_token("abc"), 108_966);
@@ -271,63 +321,57 @@ fn normalized_uin(value: &str) -> String {
 }
 
 async fn fetch_login_sig(client: &Client, user_agent: &str) -> Result<String, String> {
-    let params = [
-        ("hide_title_bar", "1"),
-        ("style", "22"),
-        ("daid", DAID),
-        ("low_login", "0"),
-        ("qlogin_auto_login", "1"),
-        ("no_verifyimg", "1"),
-        ("link_target", "blank"),
-        ("appid", APP_ID),
-        ("target", "self"),
-        ("s_url", S_URL),
-        ("proxy_url", PROXY_URL),
-        ("pt_no_auth", "1"),
-    ];
     let response = client
         .get(XLOGIN_URL)
         .header(USER_AGENT, user_agent)
-        .query(&params)
+        .query(&[
+            ("hide_title_bar", "1"),
+            ("style", "22"),
+            ("daid", DAID),
+            ("low_login", "0"),
+            ("qlogin_auto_login", "1"),
+            ("no_verifyimg", "1"),
+            ("link_target", "blank"),
+            ("appid", APP_ID),
+            ("target", "self"),
+            ("s_url", S_URL),
+            ("proxy_url", PROXY_URL),
+            ("pt_no_auth", "1"),
+        ])
         .send()
         .await
-        .map_err(|e| format!("xlogin 请求失败: {e}"))?;
+        .map_err(|error| format!("xlogin 请求失败: {error}"))?;
     if !response.status().is_success() {
         return Err(format!("xlogin 返回 HTTP {}", response.status()));
     }
-    let sig = response
+    response
         .cookies()
-        .find(|c| c.name() == "pt_login_sig")
-        .map(|c| c.value().to_owned());
-    sig.ok_or("xlogin 响应中缺少 pt_login_sig cookie".into())
+        .find(|cookie| cookie.name() == "pt_login_sig")
+        .map(|cookie| cookie.value().to_owned())
+        .ok_or_else(|| "xlogin 响应中缺少 pt_login_sig cookie".into())
+}
+
+fn random_hex(len: usize) -> String {
+    let seed = unix_millis() ^ (USER_AGENT_SEQUENCE.load(Ordering::Relaxed) as u128);
+    let mut state = seed.wrapping_mul(0x9E37_79B9);
+    let mut result = String::with_capacity(len);
+    for _ in 0..len {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        result.push(char::from_digit(((state >> 32) & 0xF) as u32, 16).unwrap_or('0'));
+    }
+    result
 }
 
 fn poll_login_url(text: &str) -> Option<String> {
-    let re = Regex::new(r"'([^']*)'").ok()?;
-    let values: Vec<&str> = re
+    let regex = Regex::new(r"'([^']*)'").ok()?;
+    let values: Vec<&str> = regex
         .captures_iter(text)
-        .filter_map(|c| c.get(1))
-        .map(|m| m.as_str())
+        .filter_map(|capture| capture.get(1))
+        .map(|value| value.as_str())
         .collect();
     (values.len() >= 3 && values[0] == "0").then(|| values[2].to_owned())
-}
-
-fn login_credentials(session: &LoginSession) -> Option<LoginCredentials> {
-    let uin = session.uin.clone()?;
-    let g_tk = session.g_tk?;
-    let allowed = ["uin", "skey", "p_uin", "pt4_token", "p_skey", "pt2gguin"];
-    let cookies = session
-        .cookies
-        .iter()
-        .filter(|(name, value)| allowed.contains(&name.as_str()) && !value.is_empty())
-        .map(|(name, value)| (name.clone(), value.clone()))
-        .collect();
-    Some(LoginCredentials {
-        uin,
-        g_tk,
-        cookies,
-        user_agent: session.user_agent.clone(),
-    })
 }
 
 #[tauri::command]
@@ -363,7 +407,6 @@ pub async fn start_qr_login(state: tauri::State<'_, QLoginState>) -> Result<QrLo
         .ok_or("二维码响应中缺少 qrsig")?;
     let mut cookies = HashMap::new();
     merge_response_cookies(&response, &mut cookies);
-    // 移动端指纹 Cookie（模拟手机 QQ 浏览器）
     cookies.insert("_qimei_fingerprint".into(), random_hex(32));
     cookies.insert("_qimei_uuid42".into(), random_hex(42));
     cookies.insert(
@@ -374,29 +417,44 @@ pub async fn start_qr_login(state: tauri::State<'_, QLoginState>) -> Result<QrLo
         .bytes()
         .await
         .map_err(|error| format!("读取二维码失败：{error}"))?;
-    *state.session.lock().await = Some(LoginSession {
-        ptqrtoken: ptqr_token(&qrsig),
-        cookies,
-        user_agent,
-        login_sig,
-        ..Default::default()
-    });
+    let session_id = QrSessionId::generate();
+    let mut session = QrLoginSession::new(cookies, user_agent);
+    session.ptqrtoken = ptqr_token(&qrsig);
+    session.login_sig = login_sig;
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
     Ok(QrLoginStart {
+        session_id,
         qr_image: format!("data:image/png;base64,{}", BASE64.encode(image)),
     })
 }
 
 #[tauri::command]
-pub async fn poll_qr_login(state: tauri::State<'_, QLoginState>) -> Result<LoginStatus, String> {
-    let mut guard = state.session.lock().await;
-    let session = guard.as_mut().ok_or("请先获取登录二维码")?;
+pub async fn poll_qr_login(
+    state: tauri::State<'_, QLoginState>,
+    session_id: QrSessionId,
+) -> Result<LoginStatus, String> {
+    let mut session = state
+        .sessions
+        .lock()
+        .await
+        .remove(&session_id)
+        .ok_or("二维码登录会话不存在或已失效")?;
+    session.poll_count = session.poll_count.saturating_add(1);
+    if session.cancelled {
+        session.clear_secrets();
+        return Err("二维码登录会话已取消".into());
+    }
     let response = state
         .client
         .get("https://ssl.ptlogin2.qq.com/ptqrlogin")
         .header(USER_AGENT, &session.user_agent)
         .header(COOKIE, cookie_header(&session.cookies))
         .query(&[
-            ("u1", S_URL),
+            ("u1", session.u1),
             ("ptqrtoken", &session.ptqrtoken.to_string()),
             ("ptredirect", "0"),
             ("h", "1"),
@@ -411,7 +469,7 @@ pub async fn poll_qr_login(state: tauri::State<'_, QLoginState>) -> Result<Login
             ("pt_uistyle", "40"),
             ("has_onekey", "1"),
             ("o1vId", ""),
-            ("aid", APP_ID),
+            ("aid", session.appid),
             ("daid", DAID),
         ])
         .send()
@@ -424,39 +482,51 @@ pub async fn poll_qr_login(state: tauri::State<'_, QLoginState>) -> Result<Login
         .map_err(|error| format!("读取扫码状态失败：{error}"))?;
 
     if text.contains("'66'") || text.contains("二维码未失效") {
+        state
+            .sessions
+            .lock()
+            .await
+            .insert(session_id.clone(), session);
         return Ok(LoginStatus {
             status: "waiting",
             message: "请使用手机 QQ 扫描二维码".into(),
-            auth: None,
+            session_id: Some(session_id.clone()),
+            qr_image: None,
         });
     }
     if text.contains("'67'") || text.contains("二维码认证中") {
+        state
+            .sessions
+            .lock()
+            .await
+            .insert(session_id.clone(), session);
         return Ok(LoginStatus {
             status: "scanned",
             message: "已扫码，请在手机上确认登录".into(),
-            auth: None,
+            session_id: Some(session_id.clone()),
+            qr_image: None,
         });
     }
     if text.contains("'65'") || text.contains("二维码已失效") {
+        session.clear_secrets();
         return Ok(LoginStatus {
             status: "expired",
             message: "二维码已失效，请刷新后重试".into(),
-            auth: None,
+            session_id: Some(session_id.clone()),
+            qr_image: None,
         });
     }
     if !(text.contains("'0'") || text.contains("登录成功")) {
+        session.clear_secrets();
         return Ok(LoginStatus {
             status: "error",
             message: "QQ 登录返回了无法识别的状态".into(),
-            auth: None,
+            session_id: Some(session_id.clone()),
+            qr_image: None,
         });
     }
 
-    let login_url = poll_login_url(&text).unwrap_or_else(|| {
-        let ptsigx = callback_query_value(&text, "ptsigx").unwrap_or_default();
-        let uin = callback_query_value(&text, "uin").unwrap_or_default();
-        format!("https://ptlogin2.qzone.qq.com/check_sig?pttype=1&uin={uin}&service=ptqrlogin&nodirect=0&ptsigx={ptsigx}&s_url={S_URL}&f_url=&ptlang=2052&ptredirect=100&aid={APP_ID}&daid={DAID}")
-    });
+    let login_url = poll_login_url(&text).ok_or("登录成功响应中缺少完整跳转 URL")?;
     let callback_uin = callback_query_value(&text, "uin").ok_or("登录成功响应中缺少 uin")?;
     let response = state
         .client
@@ -485,30 +555,42 @@ pub async fn poll_qr_login(state: tauri::State<'_, QLoginState>) -> Result<Login
     session.g_tk = Some(bkn(p_skey));
     session.uin = Some(uin.clone());
     session.user_agent = account_user_agent(&uin);
-    let auth = login_credentials(session).ok_or("登录凭证不完整")?;
+    let authenticated = LoginSession {
+        ptqrtoken: session.ptqrtoken,
+        cookies: session.cookies.clone(),
+        uin: session.uin.clone(),
+        g_tk: session.g_tk,
+        user_agent: session.user_agent.clone(),
+    };
+    session.clear_secrets();
+    *state.session.lock().await = Some(authenticated);
     Ok(LoginStatus {
         status: "success",
         message: "登录成功".into(),
-        auth: Some(auth),
+        session_id: Some(session_id.clone()),
+        qr_image: None,
     })
 }
 
 #[tauri::command]
 pub async fn get_login_status(state: tauri::State<'_, QLoginState>) -> Result<LoginStatus, String> {
     let guard = state.session.lock().await;
-    if let Some(session) = guard.as_ref() {
-        if let Some(auth) = login_credentials(session) {
-            return Ok(LoginStatus {
-                status: "success",
-                message: "已登录".into(),
-                auth: Some(auth),
-            });
-        }
+    if guard
+        .as_ref()
+        .is_some_and(|session| session.uin.is_some() && session.g_tk.is_some())
+    {
+        return Ok(LoginStatus {
+            status: "success",
+            message: "已登录".into(),
+            session_id: None,
+            qr_image: None,
+        });
     }
     Ok(LoginStatus {
         status: "loggedOut",
         message: "尚未登录".into(),
-        auth: None,
+        session_id: None,
+        qr_image: None,
     })
 }
 
@@ -525,7 +607,8 @@ pub async fn open_web_login(app: tauri::AppHandle) -> Result<LoginStatus, String
         return Ok(LoginStatus {
             status: "webLoginOpened",
             message: "登录窗口已打开，请在窗口中完成 QQ 登录".into(),
-            auth: None,
+            session_id: None,
+            qr_image: None,
         });
     }
 
@@ -549,7 +632,8 @@ pub async fn open_web_login(app: tauri::AppHandle) -> Result<LoginStatus, String
     Ok(LoginStatus {
         status: "webLoginOpened",
         message: "请在打开的窗口中完成 QQ 登录".into(),
-        auth: None,
+        session_id: None,
+        qr_image: None,
     })
 }
 
@@ -562,7 +646,8 @@ pub async fn check_web_login(
         return Ok(LoginStatus {
             status: "webLoginCancelled",
             message: "登录窗口已关闭".into(),
-            auth: None,
+            session_id: None,
+            qr_image: None,
         });
     };
 
@@ -596,7 +681,8 @@ pub async fn check_web_login(
             return Ok(LoginStatus {
                 status: "webLoginWaiting",
                 message: "等待登录完成…".into(),
-                auth: None,
+                session_id: None,
+                qr_image: None,
             });
         }
     };
@@ -620,10 +706,7 @@ pub async fn check_web_login(
         uin: Some(normalized_uin(&uin)),
         g_tk: Some(g_tk),
         user_agent,
-        ..Default::default()
     };
-
-    let auth = login_credentials(&session).ok_or("登录凭证不完整")?;
 
     if let Some(w) = app.get_webview_window(WEB_LOGIN_WINDOW_LABEL) {
         w.close().ok();
@@ -634,7 +717,8 @@ pub async fn check_web_login(
     Ok(LoginStatus {
         status: "success",
         message: "登录成功".into(),
-        auth: Some(auth),
+        session_id: None,
+        qr_image: None,
     })
 }
 
