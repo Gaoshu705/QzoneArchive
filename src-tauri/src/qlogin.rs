@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -31,6 +31,10 @@ const MOBILE_USER_AGENTS: &[&str] = &[
 ];
 static USER_AGENT_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
+const QR_SESSION_TTL_MS: u128 = 5 * 60 * 1000;
+const MAX_QR_SESSIONS: usize = 16;
+const MAX_POLLS: u32 = 180;
+const MAX_REFRESHES: u32 = 3;
 const WEB_LOGIN_URL: &str = "https://i.qq.com";
 const WEB_LOGIN_WINDOW_LABEL: &str = "qq-web-login";
 
@@ -55,7 +59,7 @@ struct QrLoginSession {
     created_at: u128,
     refresh_count: u32,
     poll_count: u32,
-    cancelled: bool,
+    generation: u64,
     cookies: HashMap<String, String>,
     user_agent: String,
     appid: &'static str,
@@ -67,12 +71,12 @@ struct QrLoginSession {
 }
 
 impl QrLoginSession {
-    fn new(cookies: HashMap<String, String>, user_agent: String) -> Self {
+    fn new(cookies: HashMap<String, String>, user_agent: String, generation: u64) -> Self {
         Self {
             created_at: unix_millis(),
             refresh_count: 0,
             poll_count: 0,
-            cancelled: false,
+            generation,
             cookies,
             user_agent,
             appid: APP_ID,
@@ -96,7 +100,6 @@ impl QrLoginSession {
 
 #[derive(Default)]
 struct LoginSession {
-    ptqrtoken: i64,
     cookies: HashMap<String, String>,
     uin: Option<String>,
     g_tk: Option<i64>,
@@ -108,6 +111,7 @@ pub struct QLoginState {
     session: Mutex<Option<LoginSession>>,
     sessions: Mutex<HashMap<QrSessionId, QrLoginSession>>,
     last_user_agent: Mutex<Option<String>>,
+    generation: AtomicU64,
 }
 
 pub(crate) struct QzoneAuth {
@@ -130,6 +134,7 @@ impl QLoginState {
             session: Mutex::new(None),
             sessions: Mutex::new(HashMap::new()),
             last_user_agent: Mutex::new(None),
+            generation: AtomicU64::new(0),
         }
     }
 
@@ -164,16 +169,8 @@ impl QLoginState {
         selected
     }
 
-    async fn qr_session(&self, session_id: &QrSessionId) -> Result<QrLoginSession, String> {
-        self.sessions
-            .lock()
-            .await
-            .get(session_id)
-            .cloned()
-            .ok_or_else(|| "二维码登录会话不存在或已失效".to_owned())
-    }
-
     pub(crate) async fn clear_session(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
         *self.session.lock().await = None;
         self.sessions.lock().await.clear();
     }
@@ -352,31 +349,49 @@ async fn fetch_login_sig(client: &Client, user_agent: &str) -> Result<String, St
 }
 
 fn random_hex(len: usize) -> String {
-    let seed = unix_millis() ^ (USER_AGENT_SEQUENCE.load(Ordering::Relaxed) as u128);
-    let mut state = seed.wrapping_mul(0x9E37_79B9);
-    let mut result = String::with_capacity(len);
-    for _ in 0..len {
-        state = state
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1_442_695_040_888_963_407);
-        result.push(char::from_digit(((state >> 32) & 0xF) as u32, 16).unwrap_or('0'));
+    let mut result = String::new();
+    while result.len() < len {
+        result.push_str(&uuid::Uuid::new_v4().simple().to_string());
     }
+    result.truncate(len);
     result
 }
 
-fn poll_login_url(text: &str) -> Option<String> {
-    let regex = Regex::new(r"'([^']*)'").ok()?;
-    let values: Vec<&str> = regex
-        .captures_iter(text)
-        .filter_map(|capture| capture.get(1))
-        .map(|value| value.as_str())
-        .collect();
-    (values.len() >= 3 && values[0] == "0").then(|| values[2].to_owned())
+fn parse_poll_callback(text: &str) -> Result<(String, String), String> {
+    let regex =
+        Regex::new(r"^ptuiCB\('([^']*)','([^']*)','([^']*)','([^']*)','([^']*)','([^']*)'\);?\s*$")
+            .map_err(|_| "登录状态解析失败")?;
+    let captures = regex
+        .captures(text.trim())
+        .ok_or("QQ 登录返回了无法识别的状态")?;
+    Ok((captures[1].to_owned(), captures[3].to_owned()))
+}
+
+fn validate_success_url(value: &str) -> Result<Url, String> {
+    let url = Url::parse(value).map_err(|_| "登录跳转地址无效")?;
+    let allowed_host = matches!(
+        url.host_str(),
+        Some("ptlogin2.qzone.qq.com" | "ssl.ptlogin2.qq.com" | "ptlogin2.qq.com")
+    );
+    if url.scheme() != "https" || !allowed_host || url.path() != "/check_sig" {
+        return Err("登录跳转地址不受信任".into());
+    }
+    let has_uin = url
+        .query_pairs()
+        .any(|(key, value)| key == "uin" && !value.is_empty());
+    let has_sig = url
+        .query_pairs()
+        .any(|(key, value)| key == "ptsigx" && !value.is_empty());
+    if !has_uin || !has_sig {
+        return Err("登录跳转信息不完整".into());
+    }
+    Ok(url)
 }
 
 #[tauri::command]
 pub async fn start_qr_login(state: tauri::State<'_, QLoginState>) -> Result<QrLoginStart, String> {
     let user_agent = state.next_mobile_user_agent().await;
+    let generation = state.generation.load(Ordering::SeqCst);
     let login_sig = fetch_login_sig(&state.client, &user_agent).await?;
     let response = state
         .client
@@ -418,14 +433,15 @@ pub async fn start_qr_login(state: tauri::State<'_, QLoginState>) -> Result<QrLo
         .await
         .map_err(|error| format!("读取二维码失败：{error}"))?;
     let session_id = QrSessionId::generate();
-    let mut session = QrLoginSession::new(cookies, user_agent);
+    let mut session = QrLoginSession::new(cookies, user_agent, generation);
     session.ptqrtoken = ptqr_token(&qrsig);
     session.login_sig = login_sig;
-    state
-        .sessions
-        .lock()
-        .await
-        .insert(session_id.clone(), session);
+    let mut sessions = state.sessions.lock().await;
+    sessions.retain(|_, value| unix_millis().saturating_sub(value.created_at) <= QR_SESSION_TTL_MS);
+    if sessions.len() >= MAX_QR_SESSIONS {
+        return Err("二维码登录会话过多，请稍后重试".into());
+    }
+    sessions.insert(session_id.clone(), session);
     Ok(QrLoginStart {
         session_id,
         qr_image: format!("data:image/png;base64,{}", BASE64.encode(image)),
@@ -443,8 +459,28 @@ pub async fn poll_qr_login(
         .await
         .remove(&session_id)
         .ok_or("二维码登录会话不存在或已失效")?;
+    if session.generation != state.generation.load(Ordering::SeqCst) {
+        session.clear_secrets();
+        return Ok(LoginStatus {
+            status: "cancelled",
+            message: "二维码登录已取消".into(),
+            session_id: Some(session_id),
+            qr_image: None,
+        });
+    }
+    if unix_millis().saturating_sub(session.created_at) > QR_SESSION_TTL_MS
+        || session.poll_count >= MAX_POLLS
+    {
+        session.clear_secrets();
+        return Ok(LoginStatus {
+            status: "timedOut",
+            message: "二维码登录已超时".into(),
+            session_id: Some(session_id),
+            qr_image: None,
+        });
+    }
     session.poll_count = session.poll_count.saturating_add(1);
-    if session.cancelled {
+    if false {
         session.clear_secrets();
         return Err("二维码登录会话已取消".into());
     }
@@ -481,56 +517,117 @@ pub async fn poll_qr_login(
         .await
         .map_err(|error| format!("读取扫码状态失败：{error}"))?;
 
-    if text.contains("'66'") || text.contains("二维码未失效") {
+    let (code, login_url) = match parse_poll_callback(&text) {
+        Ok(value) => value,
+        Err(_) => {
+            session.clear_secrets();
+            return Ok(LoginStatus {
+                status: "error",
+                message: "QQ 登录返回了无法识别的状态".into(),
+                session_id: Some(session_id),
+                qr_image: None,
+            });
+        }
+    };
+    if code == "66" || code == "67" {
+        let status = if code == "66" { "waiting" } else { "scanned" };
+        let message = if code == "66" {
+            "请使用手机 QQ 扫描二维码"
+        } else {
+            "已扫码，请在手机上确认登录"
+        };
+        let mut sessions = state.sessions.lock().await;
+        if sessions.contains_key(&session_id) {
+            session.clear_secrets();
+            return Ok(LoginStatus {
+                status: "error",
+                message: "已有并发轮询正在处理".into(),
+                session_id: Some(session_id),
+                qr_image: None,
+            });
+        }
+        sessions.insert(session_id.clone(), session);
+        return Ok(LoginStatus {
+            status,
+            message: message.into(),
+            session_id: Some(session_id),
+            qr_image: None,
+        });
+    }
+    if code == "65" {
+        if session.refresh_count >= MAX_REFRESHES {
+            session.clear_secrets();
+            return Ok(LoginStatus {
+                status: "expired",
+                message: "二维码刷新次数已达上限".into(),
+                session_id: Some(session_id),
+                qr_image: None,
+            });
+        }
+        let response = state
+            .client
+            .get("https://ssl.ptlogin2.qq.com/ptqrshow")
+            .header(USER_AGENT, &session.user_agent)
+            .header(COOKIE, cookie_header(&session.cookies))
+            .query(&[
+                ("appid", APP_ID),
+                ("e", "2"),
+                ("l", "M"),
+                ("s", "3"),
+                ("d", "72"),
+                ("v", "4"),
+                ("t", &unix_millis().to_string()),
+                ("daid", DAID),
+                ("pt_3rd_aid", "0"),
+                ("u1", S_URL),
+            ])
+            .send()
+            .await
+            .map_err(|_| "刷新登录二维码失败")?;
+        let qrsig = response
+            .cookies()
+            .find(|cookie| cookie.name() == "qrsig" && !cookie.value().is_empty())
+            .map(|cookie| cookie.value().to_owned())
+            .ok_or("二维码刷新响应缺少有效签名")?;
+        merge_response_cookies(&response, &mut session.cookies);
+        let image = response.bytes().await.map_err(|_| "读取刷新二维码失败")?;
+        session.ptqrtoken = ptqr_token(&qrsig);
+        session.refresh_count += 1;
+        if session.generation != state.generation.load(Ordering::SeqCst) {
+            session.clear_secrets();
+            return Ok(LoginStatus {
+                status: "cancelled",
+                message: "二维码登录已取消".into(),
+                session_id: Some(session_id),
+                qr_image: None,
+            });
+        }
         state
             .sessions
             .lock()
             .await
             .insert(session_id.clone(), session);
         return Ok(LoginStatus {
-            status: "waiting",
-            message: "请使用手机 QQ 扫描二维码".into(),
-            session_id: Some(session_id.clone()),
-            qr_image: None,
+            status: "refreshed",
+            message: "二维码已自动刷新".into(),
+            session_id: Some(session_id),
+            qr_image: Some(format!("data:image/png;base64,{}", BASE64.encode(image))),
         });
     }
-    if text.contains("'67'") || text.contains("二维码认证中") {
-        state
-            .sessions
-            .lock()
-            .await
-            .insert(session_id.clone(), session);
-        return Ok(LoginStatus {
-            status: "scanned",
-            message: "已扫码，请在手机上确认登录".into(),
-            session_id: Some(session_id.clone()),
-            qr_image: None,
-        });
-    }
-    if text.contains("'65'") || text.contains("二维码已失效") {
-        session.clear_secrets();
-        return Ok(LoginStatus {
-            status: "expired",
-            message: "二维码已失效，请刷新后重试".into(),
-            session_id: Some(session_id.clone()),
-            qr_image: None,
-        });
-    }
-    if !(text.contains("'0'") || text.contains("登录成功")) {
+    if code != "0" {
         session.clear_secrets();
         return Ok(LoginStatus {
             status: "error",
             message: "QQ 登录返回了无法识别的状态".into(),
-            session_id: Some(session_id.clone()),
+            session_id: Some(session_id),
             qr_image: None,
         });
     }
-
-    let login_url = poll_login_url(&text).ok_or("登录成功响应中缺少完整跳转 URL")?;
+    let login_url = validate_success_url(&login_url)?;
     let callback_uin = callback_query_value(&text, "uin").ok_or("登录成功响应中缺少 uin")?;
     let response = state
         .client
-        .get(&login_url)
+        .get(login_url)
         .header(USER_AGENT, &session.user_agent)
         .header(COOKIE, cookie_header(&session.cookies))
         .send()
@@ -542,21 +639,11 @@ pub async fn poll_qr_login(
         .cookies
         .get("p_skey")
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            let available = session
-                .cookies
-                .iter()
-                .filter(|(_, value)| !value.trim().is_empty())
-                .map(|(name, _)| name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("登录 Cookie 中缺少有效的 p_skey（当前 Cookie：{available}）")
-        })?;
+        .ok_or_else(|| "登录凭据不完整".to_owned())?;
     session.g_tk = Some(bkn(p_skey));
     session.uin = Some(uin.clone());
     session.user_agent = account_user_agent(&uin);
     let authenticated = LoginSession {
-        ptqrtoken: session.ptqrtoken,
         cookies: session.cookies.clone(),
         uin: session.uin.clone(),
         g_tk: session.g_tk,
@@ -570,6 +657,17 @@ pub async fn poll_qr_login(
         session_id: Some(session_id.clone()),
         qr_image: None,
     })
+}
+
+#[tauri::command]
+pub async fn cancel_qr_login(
+    state: tauri::State<'_, QLoginState>,
+    session_id: QrSessionId,
+) -> Result<(), String> {
+    if let Some(mut session) = state.sessions.lock().await.remove(&session_id) {
+        session.clear_secrets();
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -666,12 +764,11 @@ pub async fn check_web_login(
         cookie_map.insert(c.name().to_string(), c.value().to_string());
     }
     // Fallback: merge all_cookies if url-scoped didn't get p_skey
-    if !cookie_map.get("p_skey").is_some_and(|v| !v.is_empty()) {
+    if cookie_map.get("p_skey").is_none_or(|v| v.is_empty()) {
         for c in &all_cookies {
-            let name = c.name().to_string();
-            if !cookie_map.contains_key(&name) {
-                cookie_map.insert(name, c.value().to_string());
-            }
+            cookie_map
+                .entry(c.name().to_string())
+                .or_insert_with(|| c.value().to_string());
         }
     }
 
@@ -701,7 +798,6 @@ pub async fn check_web_login(
     let user_agent = account_user_agent(&uin);
 
     let session = LoginSession {
-        ptqrtoken: 0,
         cookies: cookie_map,
         uin: Some(normalized_uin(&uin)),
         g_tk: Some(g_tk),

@@ -15,6 +15,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             qlogin::start_qr_login,
             qlogin::poll_qr_login,
+            qlogin::cancel_qr_login,
             qlogin::get_login_status,
             qlogin::logout_qzone,
             qlogin::open_web_login,
