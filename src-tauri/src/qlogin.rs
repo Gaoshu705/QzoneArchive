@@ -45,14 +45,6 @@ const WEB_LOGIN_WINDOW_LABEL: &str = "qq-web-login";
 const MAX_PROFILE_BYTES: usize = 256 * 1024;
 const MAX_AVATAR_BYTES: usize = 2 * 1024 * 1024;
 const REQUIRED_WEB_COOKIES: &[&str] = &["uin", "p_uin", "p_skey", "skey", "pt4_token"];
-const ALLOWED_WEB_COOKIE_DOMAINS: &[&str] = &[
-    "qq.com",
-    ".qq.com",
-    "i.qq.com",
-    ".i.qq.com",
-    "qzone.qq.com",
-    ".qzone.qq.com",
-];
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -130,6 +122,7 @@ struct LoginSession {
     uin: Option<String>,
     g_tk: Option<i64>,
     user_agent: String,
+    web_attempt: Option<u64>,
 }
 
 pub struct QLoginState {
@@ -825,6 +818,7 @@ async fn poll_inner(state: &QLoginState, id: QrSessionId) -> Result<LoginStatus,
                 uin: Some(cu),
                 g_tk: Some(bkn(&key)),
                 user_agent: s.user_agent.clone(),
+                web_attempt: None,
             });
             s.clear_secrets();
             Ok(login_status(&id, "success", "登录成功", None))
@@ -1129,9 +1123,7 @@ pub async fn check_web_login(
     // credentials from known QQ domains, never the WebView's complete cookie collection.
     if cookie_map.get("p_skey").is_none_or(|v| v.is_empty()) {
         for c in &all_cookies {
-            let allowed_domain = c
-                .domain()
-                .is_some_and(|domain| ALLOWED_WEB_COOKIE_DOMAINS.contains(&domain));
+            let allowed_domain = allowed_qq_cookie_domain(c.domain());
             if allowed_domain
                 && REQUIRED_WEB_COOKIES.contains(&c.name())
                 && !c.value().trim().is_empty()
@@ -1174,6 +1166,7 @@ pub async fn check_web_login(
         uin: Some(uin),
         g_tk: Some(g_tk),
         user_agent,
+        web_attempt: Some(generation),
     };
 
     let _commit = state.lifecycle_commit.lock().await;
@@ -1205,8 +1198,17 @@ pub async fn cancel_web_login(
     app: tauri::AppHandle,
     state: tauri::State<'_, QLoginState>,
 ) -> Result<(), String> {
-    // Only invalidate the currently open WebView attempt. An already committed session is retained.
+    // Invalidate only the current WebView attempt. If its check committed while cancel
+    // waited for the lifecycle lock, revoke that attempt's session but retain older auth.
     let _commit = state.lifecycle_commit.lock().await;
-    state.web_generation.fetch_add(1, Ordering::SeqCst);
+    let attempt = state.web_generation.fetch_add(1, Ordering::SeqCst);
+    let mut session = state.session.lock().await;
+    if session
+        .as_ref()
+        .is_some_and(|session| session.web_attempt == Some(attempt))
+    {
+        *session = None;
+    }
+    drop(session);
     clear_web_login_window(&app)
 }

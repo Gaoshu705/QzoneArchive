@@ -66,7 +66,15 @@ export const useAuthStore = defineStore("auth", () => {
     } catch (error) { if (run === pollingRun) { status.value = "error"; message.value = errorMessage(error, "网页登录服务暂时不可用"); } }
     finally { if (run === pollingRun) loading.value = false; }
   }
-  async function cancelWebLogin() { pollingRun += 1; loading.value = false; await cancelWebLoginCommand().catch(() => {}); webLoginMode.value = false; status.value = "loggedOut"; message.value = "使用手机 QQ 扫码登录"; }
+  async function cancelWebLogin() {
+    pollingRun += 1; loading.value = false;
+    await cancelWebLoginCommand().catch(() => {}); webLoginMode.value = false;
+    const backend = await invoke<LoginStatus>("get_login_status").catch(() => undefined);
+    status.value = backend?.status ?? "loggedOut";
+    message.value = backend?.status === "success" ? "已保留先前登录会话" : "使用手机 QQ 扫码登录";
+    if (backend?.status === "success" && !user.value) await loadProfile();
+    if (backend?.status !== "success") user.value = undefined;
+  }
   async function logout() {
     pollingRun += 1; loading.value = true; dialogVisible.value = false; qrSessionId = undefined;
     try { await invoke("logout_qzone"); } finally { user.value = undefined; qrImage.value = ""; webLoginMode.value = false; status.value = "loggedOut"; message.value = "尚未登录"; loading.value = false; }
