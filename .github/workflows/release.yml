@@ -249,10 +249,15 @@ jobs:
           path: src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk
           if-no-files-found: error
 
-  # ── iOS ARM64 未签名 IPA ─────────────────────────────
+  # ── iOS ARM64 Ad Hoc IPA ─────────────────────────────
   ios:
     # iOS 构建只能在 macOS Runner 上执行。
     runs-on: macos-15
+    environment: ios-release
+    env:
+      IOS_CERTIFICATE: ${{ secrets.IOS_CERTIFICATE }}
+      IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+      IOS_MOBILE_PROVISION: ${{ secrets.IOS_MOBILE_PROVISION }}
 
     steps:
       - name: Checkout
@@ -299,11 +304,22 @@ jobs:
 
           npx tauri --version
 
-          if ! npx tauri ios build --help | grep -q -- "--no-sign"; then
-            echo "The installed Tauri CLI does not support ios build --no-sign."
-            echo "Please update @tauri-apps/cli to version 2.11 or newer."
+          if ! npx tauri ios build --help | grep -q -- "--export-method"; then
+            echo "The installed Tauri CLI does not support iOS export methods."
             exit 1
           fi
+
+      - name: Verify iOS signing inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for secret_name in IOS_CERTIFICATE IOS_CERTIFICATE_PASSWORD IOS_MOBILE_PROVISION; do
+            if [ -z "${!secret_name}" ]; then
+              echo "Missing required iOS signing secret: $secret_name"
+              exit 1
+            fi
+          done
 
       - name: Initialize iOS project
         shell: bash
@@ -313,6 +329,16 @@ jobs:
           # 仓库目前没有提交 gen/apple，因此在 CI 中生成。
           rm -rf src-tauri/gen/apple
           npx tauri ios init --ci
+
+      - name: Generate iOS app icon
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          npx tauri icon src-tauri/icons/qzone-archive-icon.png --ios-color '#FFFFFF'
+
+          test -f src-tauri/gen/apple/Assets.xcassets/AppIcon.appiconset/Contents.json
+          test -f src-tauri/gen/apple/Assets.xcassets/AppIcon.appiconset/AppIcon-60x60@3x.png
 
       - name: Add iOS privacy manifest
         shell: bash
@@ -343,7 +369,7 @@ jobs:
 
           plutil -lint src-tauri/gen/apple/PrivacyInfo.xcprivacy
 
-      - name: Build unsigned iOS IPA
+      - name: Build signed iOS IPA
         shell: bash
         run: |
           set -euo pipefail
@@ -351,10 +377,10 @@ jobs:
           npx tauri ios build \
             --target aarch64 \
             --ci \
-            --no-sign \
+            --export-method release-testing \
             --build-number "${{ github.run_number }}"
 
-      - name: Collect unsigned iOS IPA
+      - name: Collect signed iOS IPA
         shell: bash
         run: |
           set -euo pipefail
@@ -370,7 +396,7 @@ jobs:
           )"
 
           if [ -z "$IPA_PATH" ] || [ ! -f "$IPA_PATH" ]; then
-            echo "Unsigned IPA was not generated."
+            echo "Signed IPA was not generated."
 
             find src-tauri/gen/apple \
               -type f \
@@ -387,7 +413,7 @@ jobs:
           REF_NAME="${GITHUB_REF_NAME:-manual}"
           SAFE_REF_NAME="${REF_NAME//\//-}"
 
-          OUTPUT_NAME="QzoneArchive-${SAFE_REF_NAME}-ios-arm64-unsigned.ipa"
+          OUTPUT_NAME="QzoneArchive-${SAFE_REF_NAME}-ios-arm64.ipa"
 
           cp "$IPA_PATH" "dist/ios/$OUTPUT_NAME"
 
@@ -400,10 +426,10 @@ jobs:
 
           cat dist/ios/SHA256SUMS-ios.txt
 
-      - name: Upload unsigned iOS IPA
+      - name: Upload signed iOS IPA
         uses: actions/upload-artifact@v4
         with:
-          name: ios-unsigned
+          name: ios
           path: |
             dist/ios/*.ipa
             dist/ios/SHA256SUMS-ios.txt
@@ -458,11 +484,6 @@ jobs:
             - macOS Intel：下载 `macos-x64` 对应的 `.dmg`。
             - macOS Apple Silicon：下载 `macos-arm64` 对应的 `.dmg`。
             - Android：下载 `.apk`。
-            - iOS：提供的是未签名 IPA，不能直接安装，也不能上传 App Store。
-
-            iOS 用户需要通过 AltStore、SideStore、Sideloadly、
-            TrollStore 或其他签名工具重新签名后安装。
-
-            未签名 IPA 文件名中包含 `unsigned`。
+            - iOS：下载适用于已注册设备的 Ad Hoc IPA。
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
