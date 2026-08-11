@@ -7,7 +7,10 @@ stdenv.mkDerivation {
   pname = "qzonearchive";
   version = "1.0.3";
 
-  src = ../dist/nix-input;
+  src = builtins.path {
+    path = ../dist/nix-input;
+    name = "qzonearchive-dist";
+  };
 
   installPhase = ''
     runHook preInstall
