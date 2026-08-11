@@ -327,7 +327,7 @@ jobs:
   # ── NixOS binary package ────────────────────────────
   nixos:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 30
     if: ${{ ! inputs.skip_nixos }}
 
     steps:
@@ -342,10 +342,17 @@ jobs:
         run: |
           set -euo pipefail
 
-          nix build -L .#qzonearchive
+          echo "::group::Nix build"
+          date -u
+          pwd
+          git rev-parse --short HEAD
+          nix build -L .#qzonearchive 2>&1 | tee /tmp/nix-build.log
+          echo "::endgroup::"
 
           ls -lh result/bin/qzonearchive
           readlink -f result/bin/qzonearchive
+          echo "last 50 nix build lines:"
+          tail -n 50 /tmp/nix-build.log
 
       - name: Package Nix result
         shell: bash
