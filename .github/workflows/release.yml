@@ -5,6 +5,31 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      skip_windows:
+        description: Skip the Windows job
+        type: boolean
+        default: false
+      skip_macos:
+        description: Skip both macOS jobs
+        type: boolean
+        default: false
+      skip_linux:
+        description: Skip the Linux deb/rpm/AppImage job
+        type: boolean
+        default: false
+      skip_android:
+        description: Skip the Android job
+        type: boolean
+        default: false
+      skip_ios:
+        description: Skip the iOS job
+        type: boolean
+        default: false
+      skip_nixos:
+        description: Skip the NixOS package job
+        type: boolean
+        default: false
 
 # 防止同一个 Tag 重复运行多个发布任务。
 concurrency:
@@ -15,6 +40,7 @@ jobs:
   # ── Windows ─────────────────────────────────────────
   windows:
     runs-on: windows-latest
+    if: ${{ ! inputs.skip_windows }}
 
     steps:
       - name: Checkout
@@ -58,6 +84,7 @@ jobs:
   # ── macOS x64 ───────────────────────────────────────
   macos-x64:
     runs-on: macos-latest
+    if: ${{ ! inputs.skip_macos }}
 
     steps:
       - name: Checkout
@@ -99,6 +126,7 @@ jobs:
   # ── macOS ARM64 ─────────────────────────────────────
   macos-arm64:
     runs-on: macos-latest
+    if: ${{ ! inputs.skip_macos }}
 
     steps:
       - name: Checkout
@@ -140,6 +168,7 @@ jobs:
   # ── Android ─────────────────────────────────────────
   android:
     runs-on: ubuntu-latest
+    if: ${{ ! inputs.skip_android }}
 
     steps:
       - name: Checkout
@@ -252,6 +281,7 @@ jobs:
   # ── Linux ────────────────────────────────────────────
   linux:
     runs-on: ubuntu-latest
+    if: ${{ ! inputs.skip_linux }}
 
     steps:
       - name: Checkout
@@ -297,6 +327,8 @@ jobs:
   # ── NixOS binary package ────────────────────────────
   nixos:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
+    if: ${{ ! inputs.skip_nixos }}
 
     steps:
       - name: Checkout
@@ -310,7 +342,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          nix build .#qzonearchive
+          nix build -L .#qzonearchive
 
           ls -lh result/bin/qzonearchive
           readlink -f result/bin/qzonearchive
@@ -337,6 +369,7 @@ jobs:
   ios:
     # iOS 构建只能在 macOS Runner 上执行。
     runs-on: macos-15
+    if: ${{ ! inputs.skip_ios }}
 
     steps:
       - name: Checkout
