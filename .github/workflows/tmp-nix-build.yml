@@ -1,0 +1,26 @@
+name: tmp-nix-build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  nixos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v16
+
+      - name: Build Nix package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          nix build -L .#qzonearchive
+
+          ls -lh result/bin/qzonearchive
+          readlink -f result/bin/qzonearchive
