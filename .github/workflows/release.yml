@@ -31,13 +31,13 @@ on:
         type: boolean
         default: false
 
-# 防止同一个 Tag 重复运行多个发布任务。
+# Prevent duplicate workflow runs for the same tag.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  # ── Windows ─────────────────────────────────────────
+  # Windows
   windows:
     runs-on: windows-latest
     if: ${{ ! inputs.skip_windows }}
@@ -81,7 +81,7 @@ jobs:
           path: src-tauri/target/release/bundle/nsis/*.exe
           if-no-files-found: error
 
-  # ── macOS x64 ───────────────────────────────────────
+  # macOS x64
   macos-x64:
     runs-on: macos-latest
     if: ${{ ! inputs.skip_macos }}
@@ -123,7 +123,7 @@ jobs:
           path: src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
           if-no-files-found: error
 
-  # ── macOS ARM64 ─────────────────────────────────────
+  # macOS ARM64
   macos-arm64:
     runs-on: macos-latest
     if: ${{ ! inputs.skip_macos }}
@@ -165,7 +165,7 @@ jobs:
           path: src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
           if-no-files-found: error
 
-  # ── Android ─────────────────────────────────────────
+  # Android
   android:
     runs-on: ubuntu-latest
     if: ${{ ! inputs.skip_android }}
@@ -278,7 +278,7 @@ jobs:
           path: src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk
           if-no-files-found: error
 
-  # ── Linux ────────────────────────────────────────────
+  # Linux
   linux:
     runs-on: ubuntu-latest
     if: ${{ ! inputs.skip_linux }}
@@ -324,7 +324,7 @@ jobs:
             src-tauri/target/release/bundle/rpm/*.rpm
           if-no-files-found: error
 
-  # ── NixOS binary package ────────────────────────────
+  # NixOS binary package
   nixos:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -418,9 +418,9 @@ EOF
           path: dist/nix/*.tar.gz
           if-no-files-found: error
 
-  # ── iOS ARM64 未签名 IPA ─────────────────────────────
+  # iOS ARM64 unsigned IPA
   ios:
-    # iOS 构建只能在 macOS Runner 上执行。
+    # iOS builds must run on a macOS runner.
     runs-on: macos-15
     if: ${{ ! inputs.skip_ios }}
 
@@ -481,7 +481,7 @@ EOF
         run: |
           set -euo pipefail
 
-          # 仓库目前没有提交 gen/apple，因此在 CI 中生成。
+          # The repo does not commit gen/apple, so generate it in CI.
           rm -rf src-tauri/gen/apple
           npx tauri ios init --ci
 
@@ -510,9 +510,9 @@ EOF
           STORE_ICON="$APPICONSET/AppIcon-512@2x.png"
           test -f "$STORE_ICON"
 
-          # ios-color 会将源图标的透明区域铺成指定背景色。
-          # sips 的 hasAlpha 只表示 PNG 是否带 Alpha 通道，并不表示存在
-          # 透明像素，因此不能把 hasAlpha: yes 当作失败条件。
+          # ios-color fills transparent source pixels with the selected background.
+          # sips hasAlpha only reports whether the PNG has an alpha channel;
+          # it does not prove that transparent pixels exist.
           sips -g pixelWidth -g pixelHeight -g hasAlpha "$STORE_ICON"
 
       - name: Configure iOS metadata and privacy manifest
@@ -562,8 +562,8 @@ EOF
           plutil -lint "$INFO_PLIST"
           plutil -lint "$PRIVACY_MANIFEST"
 
-          # ios init 已经生成了 xcodeproj，因此显式把 manifest 加入应用
-          # target 的 Copy Bundle Resources 阶段。
+          # ios init generates the xcodeproj already; add the manifest to the app
+          # target Copy Bundle Resources phase explicitly.
           INFO_PLIST="$INFO_PLIST" PRIVACY_MANIFEST="$PRIVACY_MANIFEST" ruby <<'RUBY'
           require "xcodeproj"
 
@@ -677,7 +677,7 @@ EOF
           test -f "$APP_PATH/AppIcon60x60@2x.png"
           grep -a -q "assets/index-" "$APP_PATH/$EXECUTABLE"
 
-          # Release 中发布的必须保持未签名状态。
+          # Published releases must remain unsigned.
           test ! -d "$APP_PATH/_CodeSignature"
           test ! -f "$APP_PATH/embedded.mobileprovision"
           if codesign -d "$APP_PATH" >/dev/null 2>&1; then
@@ -702,7 +702,7 @@ EOF
             dist/ios/SHA256SUMS-ios.txt
           if-no-files-found: error
 
-  # ── GitHub Release ──────────────────────────────────
+  # GitHub Release
   publish:
     needs:
       - windows
@@ -715,8 +715,8 @@ EOF
 
     runs-on: ubuntu-latest
 
-    # 手动运行工作流时只生成 Actions Artifacts；
-    # 推送 v* Tag 时才创建 GitHub Release。
+    # Manual workflow runs only produce Actions Artifacts;
+    # pushing a v* tag creates a GitHub Release.
     if: startsWith(github.ref, 'refs/tags/v')
 
     permissions:
@@ -793,16 +793,16 @@ EOF
           generate_release_notes: true
           fail_on_unmatched_files: true
           body: |
-            ## 安装说明
+            ## Installation
 
-            本 Release 提供 Windows 安装包、macOS x64/ARM64 DMG、Android APK、
-            未签名的 iOS IPA，以及 Linux AppImage、deb、rpm 和 NixOS 二进制包。
+            This release includes Windows installers, macOS x64/ARM64 DMGs, Android APK,
+            unsigned iOS IPA, plus Linux AppImage, deb, rpm and NixOS binary packages.
 
-            iOS IPA 不能直接安装，也不能上传 App Store。
+            The iOS IPA cannot be installed directly or uploaded to the App Store.
 
-            iOS 用户需要通过 AltStore、SideStore、Sideloadly、
-            TrollStore 或其他签名工具重新签名后安装。
+            iOS users need AltStore, SideStore, Sideloadly,
+            TrollStore, or another signing tool to sign and install it.
 
-            未签名 IPA 文件名中包含 `unsigned`。
+            Unsigned IPA filenames contain `unsigned`.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
