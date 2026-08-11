@@ -337,22 +337,56 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v16
 
+      - name: Show Nix toolbox
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          date -u
+          pwd
+          git rev-parse --short HEAD
+          nix --version
+          node --version || true
+          npm --version || true
+
+      - name: Evaluate Nix flake
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          nix flake show --no-write-lock-file
+
+      - name: Install frontend deps in Nix shell
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          nix develop --command bash -c 'npm ci'
+
+      - name: Build frontend and Tauri binary in Nix shell
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          nix develop --command bash -c 'npm run build && npx tauri build --no-bundle --ci'
+
+      - name: Verify Nix output
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ls -lh src-tauri/target/release/qzonearchive
+          file src-tauri/target/release/qzonearchive
+
       - name: Build Nix package
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "::group::Nix build"
-          date -u
-          pwd
-          git rev-parse --short HEAD
-          nix build -L .#qzonearchive 2>&1 | tee /tmp/nix-build.log
-          echo "::endgroup::"
+          nix build .#qzonearchive
 
           ls -lh result/bin/qzonearchive
           readlink -f result/bin/qzonearchive
-          echo "last 50 nix build lines:"
-          tail -n 50 /tmp/nix-build.log
 
       - name: Package Nix result
         shell: bash
