@@ -1,6 +1,6 @@
 { pkgs }:
 let
-  nodejs = pkgs.nodejs_20;
+  nodejs = pkgs.nodejs_22;
   lib = pkgs.lib;
   stdenv = pkgs.stdenv;
 in
