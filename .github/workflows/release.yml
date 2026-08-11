@@ -398,14 +398,14 @@ jobs:
           cp src-tauri/icons/icon.png qzonearchive/share/icons/hicolor/512x512/apps/qzonearchive.png
 
           cat > qzonearchive/share/applications/qzonearchive.desktop <<'EOF'
-[Desktop Entry]
-Type=Application
-Name=空间归档
-Comment=本地 QQ 空间归档工具
-Exec=bin/qzonearchive
-Icon=qzonearchive
-Categories=Utility;
-EOF
+          [Desktop Entry]
+          Type=Application
+          Name=空间归档
+          Comment=本地 QQ 空间归档工具
+          Exec=bin/qzonearchive
+          Icon=qzonearchive
+          Categories=Utility;
+          EOF
 
           tar -czf dist/nix/qzonearchive-nixos-x86_64-linux.tar.gz \
             qzonearchive
