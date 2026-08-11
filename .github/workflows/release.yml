@@ -337,7 +337,7 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v16
 
-      - name: Show Nix toolbox
+      - name: Show build environment
         shell: bash
         run: |
           set -euo pipefail
@@ -348,29 +348,25 @@ jobs:
           nix --version
           node --version || true
           npm --version || true
+          rustc --version || true
+          cargo --version || true
 
-      - name: Evaluate Nix flake
+      - name: Install frontend dependencies
         shell: bash
         run: |
           set -euo pipefail
 
-          nix flake show --no-write-lock-file
+          npm ci
 
-      - name: Install frontend deps in Nix shell
+      - name: Build frontend and Tauri binary
         shell: bash
         run: |
           set -euo pipefail
 
-          nix develop --command bash -c 'npm ci'
+          npm run build
+          npx tauri build --no-bundle --ci
 
-      - name: Build frontend and Tauri binary in Nix shell
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          nix develop --command bash -c 'npm run build && npx tauri build --no-bundle --ci'
-
-      - name: Verify Nix output
+      - name: Verify built binary
         shell: bash
         run: |
           set -euo pipefail
@@ -378,13 +374,17 @@ jobs:
           ls -lh src-tauri/target/release/qzonearchive
           file src-tauri/target/release/qzonearchive
 
-      - name: Build Nix package
+          mkdir -p dist/nix-input/bin dist/nix-input/icons
+          cp src-tauri/target/release/qzonearchive dist/nix-input/bin/qzonearchive
+          cp src-tauri/icons/icon.png dist/nix-input/icons/icon.png
+          ls -lhR dist/nix-input
+
+      - name: Package Nix installable result
         shell: bash
         run: |
           set -euo pipefail
 
-          nix build .#qzonearchive
-
+          nix build -L .#qzonearchive
           ls -lh result/bin/qzonearchive
           readlink -f result/bin/qzonearchive
 

@@ -1,6 +1,5 @@
 { pkgs }:
 let
-  nodejs = pkgs.nodejs_22;
   lib = pkgs.lib;
   stdenv = pkgs.stdenv;
 in
@@ -8,49 +7,14 @@ stdenv.mkDerivation {
   pname = "qzonearchive";
   version = "1.0.3";
 
-  src = lib.cleanSource ../.;
-
-  nativeBuildInputs = with pkgs; [
-    nodejs
-    pkg-config
-    cmake
-    gcc
-    gnumake
-    rustc
-    cargo
-    perl
-    wrapGAppsHook3
-  ];
-
-  buildInputs = with pkgs; [
-    glib
-    gtk3
-    webkitgtk_4_1
-    libsoup_3
-    openssl
-    patchelf
-    sqlite
-    xdotool
-    gst_all_1.gst-plugins-base
-    gst_all_1.gst-plugins-good
-    gst_all_1.gst-plugins-bad
-  ];
-
-  configurePhase = ''
-    npm ci
-  '';
-
-  buildPhase = ''
-    npm run build
-    npx tauri build --no-bundle --ci
-  '';
+  src = ../dist/nix-input;
 
   installPhase = ''
     runHook preInstall
 
-    install -Dm755 src-tauri/target/release/qzonearchive "$out/bin/qzonearchive"
+    install -Dm755 bin/qzonearchive "$out/bin/qzonearchive"
 
-    install -Dm644 src-tauri/icons/icon.png "$out/share/icons/hicolor/512x512/apps/qzonearchive.png"
+    install -Dm644 icons/icon.png "$out/share/icons/hicolor/512x512/apps/qzonearchive.png"
 
     mkdir -p "$out/share/applications"
     cat > "$out/share/applications/qzonearchive.desktop" <<EOF
