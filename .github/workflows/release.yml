@@ -386,27 +386,27 @@ jobs:
           ls -lh src-tauri/target/release/qzonearchive
           file src-tauri/target/release/qzonearchive
 
-          mkdir -p dist/nix-input/bin dist/nix-input/icons
-          cp src-tauri/target/release/qzonearchive dist/nix-input/bin/qzonearchive
-          cp src-tauri/icons/icon.png dist/nix-input/icons/icon.png
-          ls -lhR dist/nix-input
-
-      - name: Package Nix installable result
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          nix build -L .#qzonearchive
-          ls -lh result/bin/qzonearchive
-          readlink -f result/bin/qzonearchive
-
       - name: Package Nix result
         shell: bash
         run: |
           set -euo pipefail
 
           mkdir -p dist/nix
-          cp -Lr result qzonearchive
+          mkdir -p qzonearchive/bin qzonearchive/share/applications qzonearchive/share/icons/hicolor/512x512/apps
+
+          cp src-tauri/target/release/qzonearchive qzonearchive/bin/qzonearchive
+          cp src-tauri/icons/icon.png qzonearchive/share/icons/hicolor/512x512/apps/qzonearchive.png
+
+          cat > qzonearchive/share/applications/qzonearchive.desktop <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=空间归档
+Comment=本地 QQ 空间归档工具
+Exec=bin/qzonearchive
+Icon=qzonearchive
+Categories=Utility;
+EOF
+
           tar -czf dist/nix/qzonearchive-nixos-x86_64-linux.tar.gz \
             qzonearchive
           ls -lh dist/nix
