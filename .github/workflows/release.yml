@@ -305,9 +305,6 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v16
 
-      - name: Configure Nix cache
-        uses: DeterminateSystems/magic-nix-cache-action@v9
-
       - name: Build Nix package
         shell: bash
         run: |
