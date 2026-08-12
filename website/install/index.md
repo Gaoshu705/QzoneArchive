@@ -38,17 +38,35 @@ sudo apt install ./*.deb
 sudo dpkg -i *.deb
 ```
 
-如果 `dpkg` 提示缺少依赖，先执行：
+> **`apt` 与 `dpkg` 的区别**：
+> - `apt install`：会自动联网补齐依赖，日常推荐使用；
+> - `dpkg -i`：只安装包本身，不处理依赖。如果提示缺少依赖，先执行下面的命令补装：
+>
+> ```bash
+> sudo apt-get install -f
+> ```
+
+卸载：
 
 ```bash
-sudo apt-get install -f
+sudo apt remove qzonearchive
 ```
+
+> 如果提示找不到包，可用 `dpkg -l | grep qzonearchive` 确认实际安装的包名（一般为 `qzonearchive`）。
 
 ### Fedora / openSUSE / RHEL 系
 
 ```bash
 sudo rpm -i *.rpm
 ```
+
+卸载：
+
+```bash
+sudo rpm -e qzonearchive
+```
+
+> 如果提示找不到包，可用 `rpm -qa | grep qzonearchive` 确认实际安装的包名（一般为 `qzonearchive`）。
 
 ### 通用 AppImage（适用于其他 Linux 发行版）
 
@@ -63,7 +81,7 @@ chmod +x *.AppImage
 > ./*.AppImage --appimage-extract-and-run
 > ```
 
-如果桌面环境没有自动集成应用菜单，可以自行创建 `.desktop` 文件，也可以直接把 AppImage 放到本地路径手动启动。
+AppImage 是免安装的绿色软件，删除文件即可完成卸载。如果桌面环境没有自动集成应用菜单，可以自行创建 `.desktop` 文件，也可以直接把 AppImage 放到本地路径手动启动。
 
 ### NixOS
 
