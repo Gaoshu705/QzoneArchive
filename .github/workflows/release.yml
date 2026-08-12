@@ -1,4 +1,4 @@
-name: Release
+﻿name: Release
 
 on:
   push:
@@ -363,52 +363,42 @@ jobs:
           rustc --version || true
           cargo --version || true
 
-      - name: Install frontend dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          npm ci
-
-      - name: Build frontend and Tauri binary
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          npm run build
-          npx tauri build --no-bundle --ci
-
-      - name: Verify built binary
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          ls -lh src-tauri/target/release/qzonearchive
-          file src-tauri/target/release/qzonearchive
-
       - name: Package Nix result
         shell: bash
         run: |
           set -euo pipefail
 
           mkdir -p dist/nix
-          mkdir -p qzonearchive/bin qzonearchive/share/applications qzonearchive/share/icons/hicolor/512x512/apps
+          nix build --extra-experimental-features "nix-command flakes" -L .#qzonearchive
 
-          cp src-tauri/target/release/qzonearchive qzonearchive/bin/qzonearchive
-          cp src-tauri/icons/icon.png qzonearchive/share/icons/hicolor/512x512/apps/qzonearchive.png
+          DRV_OUT_PATH="$(readlink -f result)"
+          echo "Nix output: $DRV_OUT_PATH"
+          mkdir -p nixos-package
+          echo "$DRV_OUT_PATH" > nixos-package/store-path.txt
 
-          cat > qzonearchive/share/applications/qzonearchive.desktop <<'EOF'
-          [Desktop Entry]
-          Type=Application
-          Name=空间归档
-          Comment=本地 QQ 空间归档工具
-          Exec=bin/qzonearchive
-          Icon=qzonearchive
-          Categories=Utility;
+          nix-store --export "$DRV_OUT_PATH" > nixos-package/qzonearchive.closure
+          echo "Closure size: $(stat -c %s nixos-package/qzonearchive.closure)"
+
+          rm -rf qzonearchive
+          cp -Lr "$DRV_OUT_PATH" qzonearchive
+
+          cat > nixos-package/install.sh <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          echo "Install steps for this NixOS release package:"
+          echo ""
+          echo "  nix-store --import < qzonearchive.closure"
+          echo "  nix profile install /nix/store/PATH-qzonearchive-1.0.3"
+          echo ""
+          echo "Replace /nix/store/PATH-qzonearchive-1.0.3 with the store path from"
+          echo "the github artifact README or the closure top record."
           EOF
+          chmod +x nixos-package/install.sh
 
           tar -czf dist/nix/qzonearchive-nixos-x86_64-linux.tar.gz \
-            qzonearchive
+            qzonearchive \
+            nixos-package
           ls -lh dist/nix
 
       - name: Upload NixOS package
