@@ -20,7 +20,7 @@ title: 安装
 
 ## Linux
 
-每个 Release 会提供三种 Linux 安装包：
+每个 Release 提供三种 Linux 安装包（具体文件名以 Release 页面实际下载到的为准，下面用 `*.ext` 通配符代替）：
 
 - `.deb`：适合 Debian、Ubuntu 及其衍生发行版
 - `.rpm`：适合 Fedora、openSUSE、RHEL 系发行版
@@ -29,13 +29,13 @@ title: 安装
 ### Debian / Ubuntu
 
 ```bash
-sudo apt install ./QzoneArchive-*.deb
+sudo apt install ./*.deb
 ```
 
 也可以使用 `dpkg`：
 
 ```bash
-sudo dpkg -i QzoneArchive-*.deb
+sudo dpkg -i *.deb
 ```
 
 如果 `dpkg` 提示缺少依赖，先执行：
@@ -47,33 +47,41 @@ sudo apt-get install -f
 ### Fedora / openSUSE / RHEL 系
 
 ```bash
-sudo rpm -i QzoneArchive-*.rpm
+sudo rpm -i *.rpm
 ```
 
-### 通用 AppImage
+### 通用 AppImage（适用于其他 Linux 发行版）
 
 ```bash
-chmod +x QzoneArchive-*.AppImage
-./QzoneArchive-*.AppImage
+chmod +x *.AppImage
+./*.AppImage
 ```
+
+> 如果提示 `libfuse.so.2` 相关错误（常见于 Ubuntu 24.04 及以上），先安装 FUSE 依赖，或改用免 FUSE 的解包运行方式：
+> ```bash
+> sudo apt install libfuse2   # Debian / Ubuntu
+> ./*.AppImage --appimage-extract-and-run
+> ```
 
 如果桌面环境没有自动集成应用菜单，可以自行创建 `.desktop` 文件，也可以直接把 AppImage 放到本地路径手动启动。
 
 ### NixOS
 
-从 GitHub Releases 下载 `qzonearchive-nixos-x86_64-linux.tar.gz` 后，可以解压直接运行：
+每个 Release 提供 NixOS 二进制包 `qzonearchive-nixos-x86_64-linux.tar.gz`，内含预构建的完整 Nix store closure 与一键安装脚本，适用于 NixOS 及其他使用 Nix 的 x86_64 Linux 系统。**安装只需一条命令**：
 
 ```bash
-tar -xzf qzonearchive-nixos-x86_64-linux.tar.gz
-./qzonearchive/bin/qzonearchive
+tar -xzf qzonearchive-nixos-x86_64-linux.tar.gz && ./install.sh
 ```
 
-也可以把解压出的目录加入 Nix profile：
+安装脚本会把依赖导入 `/nix/store` 并安装到当前用户 profile。提示输入密码时输入当前用户密码即可（与 `apt`/`dpkg` 相同）。完成后在终端运行：
 
 ```bash
-tar -xzf qzonearchive-nixos-x86_64-linux.tar.gz
-nix profile install ./qzonearchive
+qzonearchive
 ```
+
+> 注意：请运行包内 `./install.sh` 完成安装，不要手动对解压目录执行 `nix profile install` 或直接运行二进制——应用依赖的 store 路径必须先导入。
+
+NixOS 用户**无需 AppImage / deb / rpm**，请直接使用上方的一键安装包。
 
 项目提供源码构建用的 Nix Flake。NixOS 用户可以进入项目目录执行：
 
@@ -85,20 +93,7 @@ nix build
 也可以安装到当前用户 profile：
 
 ```bash
-nix profile install
-```
-
-如果只为了快速验证官方 Release 的 AppImage，可以先启用 AppImage 支持：
-
-```nix
-programs.appimage.enable = true;
-```
-
-然后执行：
-
-```bash
-chmod +x QzoneArchive-*.AppImage
-./QzoneArchive-*.AppImage
+nix profile install .#qzonearchive
 ```
 
 Linux 用户安装 QQ 客户端时，请按你自己发行版的要求选择 QQ 官方提供的 deb、rpm 或 Flatpak 版本；空间归档本身不绑定或内置 QQ 客户端，只需要登录后扫描 QQ 空间的二维码即可使用。
