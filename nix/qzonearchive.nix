@@ -1,4 +1,4 @@
-﻿{ pkgs }:
+ pkgs }:
 let
   lib = pkgs.lib;
   stdenv = pkgs.stdenv;
