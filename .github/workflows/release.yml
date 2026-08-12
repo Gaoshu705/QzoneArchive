@@ -368,44 +368,102 @@ jobs:
         run: |
           set -euo pipefail
 
-          mkdir -p dist/nix
           nix build --extra-experimental-features "nix-command flakes" -L .#qzonearchive
 
           DRV_OUT_PATH="$(readlink -f result)"
           echo "Nix output: $DRV_OUT_PATH"
-          mkdir -p nixos-package
-          echo "$DRV_OUT_PATH" > nixos-package/store-path.txt
+          test -x "$DRV_OUT_PATH/bin/qzonearchive"
+
+          # 自包含文件：install.sh + closure + store-path.txt + README，解压后一条命令安装
+          mkdir -p dist/nix
+          echo "$DRV_OUT_PATH" > dist/nix/store-path.txt
 
           mapfile -t CLOSURE_PATHS < <(nix-store -qR "$DRV_OUT_PATH")
-          nix-store --export "${CLOSURE_PATHS[@]}" > nixos-package/qzonearchive.closure
-          echo "Closure size: $(stat -c %s nixos-package/qzonearchive.closure)"
+          nix-store --export "${CLOSURE_PATHS[@]}" > dist/nix/qzonearchive.closure
+          echo "Closure size: $(stat -c %s dist/nix/qzonearchive.closure)"
           echo "Closure paths: ${#CLOSURE_PATHS[@]}"
 
-          rm -rf qzonearchive
-          cp -Lr "$DRV_OUT_PATH" qzonearchive
-
-          cat > nixos-package/install.sh <<'EOF'
+          cat > dist/nix/install.sh <<'EOF'
           #!/usr/bin/env bash
+          # QzoneArchive NixOS 一键安装（类似 deb 的体验）
           set -euo pipefail
 
-          SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-          STORE_PATH="$(cat "$SCRIPT_DIR/store-path.txt")"
+          HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          STORE_PATH="$(cat "$HERE/store-path.txt")"
+          CLOSURE="$HERE/qzonearchive.closure"
 
-          echo "Importing the Nix closure into the store (needs sudo, may take a while)..."
-          sudo nix-store --option require-sigs false --import < "$SCRIPT_DIR/qzonearchive.closure"
+          command -v nix >/dev/null 2>&1 || { echo "错误: 未找到 nix，请先安装 NixOS 或 Nix。" >&2; exit 1; }
+          [ -f "$CLOSURE" ] || { echo "错误: 缺少 $CLOSURE，请确认压缩包完整。" >&2; exit 1; }
 
-          echo "Installing $STORE_PATH into the user profile..."
+          # 已安装则跳过（幂等）
+          if nix --extra-experimental-features "nix-command flakes" profile list 2>/dev/null \
+            | sed 's/\x1b\[[0-9;]*m//g' | grep -Fq "$STORE_PATH"; then
+            echo "qzonearchive 已安装，运行 qzonearchive 即可启动。"
+            exit 0
+          fi
+
+          # 导入依赖（sudo 会提示输入密码，与 apt/dpkg 相同）
+          if [ -w /nix/store ]; then
+            echo "正在导入依赖（约 1.3 GB），请稍候..."
+            nix-store --option require-sigs false --import < "$CLOSURE"
+          elif sudo -n true 2>/dev/null || [ -t 0 ]; then
+            echo "正在导入依赖（约 1.3 GB，需要 sudo，请稍候）..."
+            sudo nix-store --option require-sigs false --import < "$CLOSURE"
+          else
+            echo "错误: 导入依赖需要 sudo 权限，请在真实终端运行本脚本（或使用 ssh -t）。" >&2
+            exit 1
+          fi
+
+          echo "正在安装到用户 profile..."
           nix --extra-experimental-features "nix-command flakes" profile install "$STORE_PATH"
 
-          echo ""
-          echo "Done. Run 'qzonearchive' to start the app."
+          if nix-store --check-validity "$STORE_PATH" >/dev/null 2>&1; then
+            echo "安装完成！在终端运行 qzonearchive 即可启动。"
+          else
+            echo "警告: 安装校验未通过，请检查上方错误。" >&2
+            exit 1
+          fi
           EOF
-          chmod +x nixos-package/install.sh
+          chmod +x dist/nix/install.sh
+          bash -n dist/nix/install.sh
+
+          cat > dist/nix/README.md <<'EOF'
+          # QzoneArchive NixOS 一键安装包
+
+          ## 安装（一条命令）
+
+          ```bash
+          tar -xzf qzonearchive-nixos-x86_64-linux.tar.gz && ./install.sh
+          ```
+
+          脚本会用 sudo 导入依赖并安装到用户 profile（提示输入密码时输入当前用户密码，与 `apt`/`dpkg` 相同）。
+          完成后在终端运行 `qzonearchive` 启动。
+
+          ## 安装完成后
+
+          安装成功后，解压出的文件（约 1.3 GB）可以删除，仅保留启动应用即可：
+
+          ```bash
+          rm install.sh qzonearchive.closure store-path.txt README.md
+          ```
+
+          ## 卸载
+
+          ```bash
+          nix profile remove qzonearchive
+          ```
+
+          ## 要求
+
+          - NixOS 或使用 Nix 的 x86_64 Linux
+          - sudo 权限（安装时输入密码）
+          EOF
 
           tar -czf dist/nix/qzonearchive-nixos-x86_64-linux.tar.gz \
-            qzonearchive \
-            nixos-package
+            -C dist/nix \
+            install.sh qzonearchive.closure store-path.txt README.md
           ls -lh dist/nix
+
 
       - name: Upload NixOS package
         uses: actions/upload-artifact@v4
