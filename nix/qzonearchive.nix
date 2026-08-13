@@ -46,7 +46,17 @@ rustPlatform.buildRustPackage {
     pkgs.gst_all_1.gst-plugins-base
     pkgs.gst_all_1.gst-plugins-good
     pkgs.gst_all_1.gst-plugins-bad
+    pkgs.gst_all_1.gst-plugins-ugly
+    pkgs.gst_all_1.gst-libav
   ];
+
+  preFixup = lib.optionalString stdenv.hostPlatform.isLinux ''
+    gappsWrapperArgs+=(
+      --set FONTCONFIG_FILE ${pkgs.makeFontsConf {
+        fontDirectories = [ pkgs.noto-fonts-cjk-sans ];
+      }}
+    )
+  '';
 
   doCheck = false;
 

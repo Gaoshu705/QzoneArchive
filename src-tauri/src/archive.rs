@@ -1807,6 +1807,7 @@ pub async fn list_archived_feeds(
 ) -> Result<Vec<ArchiveItem>, String> {
     validate_category(&category)?;
     let owner_uin = login.qzone_auth().await?.uin;
+    tauri::async_runtime::spawn_blocking(move || {
     let connection = open_database(&app)?;
     let mut statement = connection
         .prepare(
@@ -1885,6 +1886,9 @@ pub async fn list_archived_feeds(
         item.likes = likes.filter_map(Result::ok).collect();
     }
     Ok(items)
+    })
+    .await
+    .map_err(|error| format!("归档查询任务异常退出：{error}"))?
 }
 
 #[tauri::command]
@@ -2456,6 +2460,7 @@ pub async fn count_archived_feeds(
 ) -> Result<u64, String> {
     validate_category(&category)?;
     let owner_uin = login.qzone_auth().await?.uin;
+    tauri::async_runtime::spawn_blocking(move || {
     let connection = open_database(&app)?;
     connection
         .query_row(
@@ -2465,6 +2470,9 @@ pub async fn count_archived_feeds(
         )
         .map(|count| count.max(0) as u64)
         .map_err(|error| format!("统计归档数量失败：{error}"))
+    })
+    .await
+    .map_err(|error| format!("归档统计任务异常退出：{error}"))?
 }
 
 #[tauri::command]
