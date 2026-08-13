@@ -29,7 +29,7 @@ jobs:
           name: qzonearchive-windows-${{ github.sha }}
           path: src-tauri/target/release/bundle/nsis/*.exe
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 90
 
   macos:
     strategy:
@@ -57,7 +57,7 @@ jobs:
           name: qzonearchive-${{ matrix.artifact }}-${{ github.sha }}
           path: src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 90
 
   linux:
     runs-on: ubuntu-latest
@@ -86,7 +86,7 @@ jobs:
             src-tauri/target/release/bundle/deb/*.deb
             src-tauri/target/release/bundle/rpm/*.rpm
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 90
 
   android:
     runs-on: ubuntu-latest
@@ -134,7 +134,7 @@ jobs:
           name: qzonearchive-android-${{ github.sha }}
           path: src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 90
 
   ios:
     runs-on: macos-15
@@ -155,7 +155,7 @@ jobs:
           name: qzonearchive-ios-unsigned-${{ github.sha }}
           path: src-tauri/gen/apple/**/*.ipa
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 90
 
   nixos:
     runs-on: ubuntu-latest
@@ -192,4 +192,4 @@ jobs:
           name: qzonearchive-nixos-${{ github.sha }}
           path: dist/qzonearchive-nixos-x86_64-linux.tar.gz
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 90
