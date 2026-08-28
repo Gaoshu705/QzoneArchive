@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { storeToRefs } from "pinia";
 import Button from "primevue/button";
+import Checkbox from "primevue/checkbox";
 import ProgressBar from "primevue/progressbar";
 import Tag from "primevue/tag";
 import {
@@ -9,7 +10,7 @@ import {
   type ArchiveProgress, type ArchiveSkipItem,
 } from "../utils/qzone";
 import { useAuthStore } from "../stores/auth";
-import { getArchiveInterval } from "../utils/appSettings";
+import { getArchiveAutoRetry, getArchiveInterval, setArchiveAutoRetry } from "../utils/appSettings";
 
 const authStore = useAuthStore();
 const { loggedIn } = storeToRefs(authStore);
@@ -18,7 +19,14 @@ const skips = ref<ArchiveSkipItem[]>([]);
 const retryingId = ref<number>();
 const skipNotice = ref("");
 const currentTime = ref(Date.now());
+const autoRetryEnabled = ref(getArchiveAutoRetry());
 let timer: ReturnType<typeof setInterval> | undefined;
+let autoStartTimer: ReturnType<typeof setTimeout> | undefined;
+let autoSkipTimer: ReturnType<typeof setTimeout> | undefined;
+let autoStarting = false;
+let autoRetryingSkips = false;
+const AUTO_START_DELAY_MS = 8_000;
+const AUTO_SKIP_RETRY_DELAY_MS = 12_000;
 const running = computed(() => progress.value.status === "running");
 const rateLimited = computed(() => progress.value.status === "limited");
 const remainingSeconds = computed(() => Math.max(0, Math.ceil((Number(progress.value.retryAt || 0) * 1000 - currentTime.value) / 1000)));
@@ -26,19 +34,98 @@ const rateWaiting = computed(() => rateLimited.value && remainingSeconds.value >
 const remainingText = computed(() => `${String(Math.floor(remainingSeconds.value / 60)).padStart(2, "0")}:${String(remainingSeconds.value % 60).padStart(2, "0")}`);
 const severity = computed(() => ({ completed: "success", error: "danger", cancelled: "warn", limited: "warn", running: "info", idle: "secondary" }[progress.value.status]));
 const statusText = computed(() => ({ idle: "未开始", running: "进行中", completed: "已完成", cancelled: "已取消", limited: "频率保护", error: "失败" }[progress.value.status]));
+const pendingSkips = computed(() => skips.value.filter((item) => !item.resolvedAt));
+const autoRetryHint = computed(() => {
+  if (!autoRetryEnabled.value) return "关闭后失败和异常请求需要手动继续";
+  if (running.value) return "归档运行中，异常列表会在空闲后继续重试";
+  if (rateWaiting.value) return `频率保护中，等待 ${remainingText.value} 后继续`;
+  if (pendingSkips.value.length) return `将持续重试 ${pendingSkips.value.length} 条待处理异常`;
+  if (progress.value.status === "error") return "检测到失败后将自动继续归档";
+  return "失败后自动继续，待重试异常会按顺序处理";
+});
+
+function clearAutoTimers() {
+  clearTimeout(autoStartTimer);
+  clearTimeout(autoSkipTimer);
+  autoStartTimer = undefined;
+  autoSkipTimer = undefined;
+}
+
+function scheduleAutoWork() {
+  if (!autoRetryEnabled.value || !loggedIn.value) {
+    clearAutoTimers();
+    return;
+  }
+  if (running.value || autoStarting) return;
+
+  if ((progress.value.status === "error" || (rateLimited.value && !rateWaiting.value)) && !autoStartTimer) {
+    autoStartTimer = setTimeout(() => {
+      autoStartTimer = undefined;
+      void autoStartArchive();
+    }, AUTO_START_DELAY_MS);
+    return;
+  }
+
+  if (!rateWaiting.value && retryingId.value === undefined && pendingSkips.value.length > 0 && !autoSkipTimer && !autoRetryingSkips) {
+    autoSkipTimer = setTimeout(() => {
+      autoSkipTimer = undefined;
+      void retryPendingSkips();
+    }, AUTO_SKIP_RETRY_DELAY_MS);
+  }
+}
+
+async function autoStartArchive() {
+  if (!loggedIn.value || running.value || rateWaiting.value) return;
+  autoStarting = true;
+  try {
+    await start();
+  } finally {
+    autoStarting = false;
+    scheduleAutoWork();
+  }
+}
+
+async function retryPendingSkips() {
+  if (!loggedIn.value || running.value || retryingId.value !== undefined || autoRetryingSkips) return;
+  autoRetryingSkips = true;
+  try {
+    for (const item of pendingSkips.value) {
+      if (running.value || rateWaiting.value) break;
+      await retrySkip(item);
+      await new Promise((resolve) => setTimeout(resolve, AUTO_SKIP_RETRY_DELAY_MS));
+    }
+  } finally {
+    autoRetryingSkips = false;
+    scheduleAutoWork();
+  }
+}
 
 async function refresh() {
   try { progress.value = await getArchiveProgress(); } catch { /* 保留当前状态 */ }
   if (!loggedIn.value) { skips.value = []; return; }
   try { skips.value = await listArchiveSkips(); } catch { /* 保留当前列表 */ }
+  scheduleAutoWork();
 }
 function beginPolling() { clearInterval(timer); timer = setInterval(() => { currentTime.value = Date.now(); void refresh(); }, 600); }
+watch(autoRetryEnabled, (enabled) => {
+  setArchiveAutoRetry(enabled);
+  if (enabled) {
+    beginPolling();
+    scheduleAutoWork();
+  } else {
+    clearAutoTimers();
+  }
+});
 async function start() {
   if (!loggedIn.value) return;
   beginPolling();
   try { progress.value = await startFeedArchive(getArchiveInterval()); }
   catch { await refresh(); }
-  finally { await refresh(); if (progress.value.status === "limited") beginPolling(); else { clearInterval(timer); timer = undefined; } }
+  finally {
+    await refresh();
+    if (progress.value.status === "limited" || (autoRetryEnabled.value && (progress.value.status === "error" || pendingSkips.value.length))) beginPolling();
+    else { clearInterval(timer); timer = undefined; }
+  }
 }
 async function cancel() { await cancelFeedArchive(); await refresh(); }
 async function retrySkip(item: ArchiveSkipItem) {
@@ -62,8 +149,12 @@ function offsetLabel(item: ArchiveSkipItem) {
   const end = item.cursorOffset + item.offsetAdvance - 1;
   return end > item.cursorOffset ? `${item.cursorOffset}–${end}` : String(item.cursorOffset);
 }
-onMounted(async () => { await refresh(); currentTime.value = Date.now(); if (running.value || rateLimited.value) beginPolling(); });
-onBeforeUnmount(() => clearInterval(timer));
+onMounted(async () => {
+  await refresh();
+  currentTime.value = Date.now();
+  if (running.value || rateLimited.value || (autoRetryEnabled.value && (progress.value.status === "error" || pendingSkips.value.length))) beginPolling();
+});
+onBeforeUnmount(() => { clearInterval(timer); clearAutoTimers(); });
 </script>
 
 <template>
@@ -74,6 +165,10 @@ onBeforeUnmount(() => clearInterval(timer));
     <div v-if="rateLimited" class="task-rate-limit"><span><i class="pi pi-shield" /></span><div><strong>接口频率保护</strong><p>为防止接口请求过于频繁，每 10 分钟最多请求 300 页。归档进度已保存，{{ rateWaiting ? `等待 ${remainingText} 后可继续` : "现在可以继续归档" }}。</p></div><b v-if="rateWaiting">{{ remainingText }}</b></div>
     <div class="task-stats"><div><span>已读取页数</span><strong>{{ progress.pages }}</strong></div><div><span>接口记录</span><strong>{{ progress.fetched }}</strong></div><div><span>写入记录</span><strong>{{ progress.saved }}</strong></div><div><span>待重试异常</span><strong>{{ progress.skipped }}</strong></div></div>
     <div v-if="!loggedIn" class="task-login-notice"><span><i class="pi pi-lock" /></span><div><strong>请先登录 QQ 空间</strong><p>登录后才能创建或继续归档任务。</p></div><Button label="立即登录" icon="pi pi-sign-in" size="small" @click="authStore.openLogin" /></div>
+    <label class="task-auto-retry" for="archive-auto-retry">
+      <Checkbox v-model="autoRetryEnabled" binary input-id="archive-auto-retry" />
+      <span><strong>自动重试</strong><small>{{ autoRetryHint }}</small></span>
+    </label>
     <div class="task-actions"><Button :label="running ? '归档中…' : rateWaiting ? `请等待 ${remainingText}` : rateLimited ? '继续归档' : '开始归档'" icon="pi pi-download" :disabled="running || rateWaiting || !loggedIn" @click="start" /><Button v-if="running" label="取消" icon="pi pi-times" severity="secondary" outlined @click="cancel" /></div>
   </section>
 

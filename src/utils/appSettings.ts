@@ -1,4 +1,5 @@
 const ARCHIVE_INTERVAL_KEY = "qzone-archive-page-interval";
+const ARCHIVE_AUTO_RETRY_KEY = "qzone-archive-auto-retry";
 export const MIN_ARCHIVE_INTERVAL = 2000;
 export const DEFAULT_ARCHIVE_INTERVAL = 3000;
 
@@ -13,4 +14,16 @@ export function setArchiveInterval(value: number) {
   return normalized;
 }
 
-export function resetAppSettings() { localStorage.removeItem(ARCHIVE_INTERVAL_KEY); }
+export function getArchiveAutoRetry() {
+  return localStorage.getItem(ARCHIVE_AUTO_RETRY_KEY) === "true";
+}
+
+export function setArchiveAutoRetry(value: boolean) {
+  localStorage.setItem(ARCHIVE_AUTO_RETRY_KEY, String(value));
+  return value;
+}
+
+export function resetAppSettings() {
+  localStorage.removeItem(ARCHIVE_INTERVAL_KEY);
+  localStorage.removeItem(ARCHIVE_AUTO_RETRY_KEY);
+}
