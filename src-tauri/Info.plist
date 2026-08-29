@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSAppTransportSecurity</key>
+  <dict>
+    <key>NSExceptionDomains</key>
+    <dict>
+      <key>qq.com</key>
+      <dict>
+        <key>NSIncludesSubdomains</key><true/>
+        <key>NSExceptionAllowsInsecureHTTPLoads</key><true/>
+      </dict>
+      <key>qpic.cn</key>
+      <dict>
+        <key>NSIncludesSubdomains</key><true/>
+        <key>NSExceptionAllowsInsecureHTTPLoads</key><true/>
+      </dict>
+      <key>gtimg.cn</key>
+      <dict>
+        <key>NSIncludesSubdomains</key><true/>
+        <key>NSExceptionAllowsInsecureHTTPLoads</key><true/>
+      </dict>
+      <key>qlogo.cn</key>
+      <dict>
+        <key>NSIncludesSubdomains</key><true/>
+        <key>NSExceptionAllowsInsecureHTTPLoads</key><true/>
+      </dict>
+    </dict>
+  </dict>
+</dict>
+</plist>
