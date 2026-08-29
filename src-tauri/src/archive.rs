@@ -614,7 +614,7 @@ struct ArchiveCheckpoint {
 
 const ARCHIVE_RATE_WINDOW_SECONDS: i64 = 10 * 60;
 const ARCHIVE_RATE_PAGE_LIMIT: i64 = 300;
-const ARCHIVE_CURSOR_MAX_AGE_SECONDS: i64 = 10 * 60;
+const ARCHIVE_CURSOR_MAX_AGE_SECONDS: i64 = 24 * 60 * 60; // patch0829: 原 10 分钟。实测同一游标连续用 1h40m 无异常；登录过期重扫码常超 10 分钟，原值会导致从第一页重走
 const ARCHIVE_SKIP_MAX_OFFSET_ADVANCE: i64 = 4_096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1463,7 +1463,7 @@ pub async fn start_feed_archive(
     if stale_checkpoint {
         set_progress(&archive, |progress| {
             progress.message =
-                "上次分页位置已超过 10 分钟，正在从第一页重新校验；已保存记录会自动去重。".into();
+                "上次分页位置已超过 24 小时，正在从第一页重新校验；已保存记录会自动去重。".into();
         });
     } else if let Some(checkpoint) = checkpoint.as_ref() {
         let saved_cursor = &checkpoint.cursor;
@@ -3163,8 +3163,8 @@ mod tests {
             updated_at: 1_000,
         };
 
-        assert!(!checkpoint_is_stale(&checkpoint, 1_599));
-        assert!(checkpoint_is_stale(&checkpoint, 1_600));
+        assert!(!checkpoint_is_stale(&checkpoint, 1_000 + super::ARCHIVE_CURSOR_MAX_AGE_SECONDS - 1));
+        assert!(checkpoint_is_stale(&checkpoint, 1_000 + super::ARCHIVE_CURSOR_MAX_AGE_SECONDS));
     }
 
     #[test]

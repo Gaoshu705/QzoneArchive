@@ -784,9 +784,10 @@ fn retryable_response_reason(status: reqwest::StatusCode, body: &str) -> Option<
                 .or_else(|| value.get("msg"))
                 .and_then(Value::as_str)
                 .unwrap_or("未知错误");
-            let permanent = ["未登录", "登录失效", "权限", "封禁", "禁止访问", "p_skey"]
-                .iter()
-                .any(|keyword| message.contains(keyword));
+            let permanent = is_login_expired_error(message)
+                || ["权限", "封禁", "禁止访问"]
+                    .iter()
+                    .any(|keyword| message.contains(keyword));
             return (!permanent).then(|| format!("接口错误 {code}：{message}"));
         }
     }
@@ -915,6 +916,11 @@ fn parse_feed_page(value: Value) -> Result<FeedPage, String> {
                 .or_else(|| value.get("msg"))
                 .and_then(Value::as_str)
                 .unwrap_or("未知错误");
+            if is_login_expired_error(message) {
+                return Err(format!(
+                    "登录失效（{code}：{message}），请重新扫码登录后再点「开始归档」，已归档进度已保存"
+                ));
+            }
             return Err(format!("QQ 空间动态接口返回错误 {code}：{message}"));
         }
     }
@@ -954,7 +960,18 @@ pub(crate) async fn fetch_feeds_once(
     fetch_feeds_with_attempts(state, refresh_type, attach_info, 1).await
 }
 
+/// QQ 侧登录态失效的典型文案（如 -3000「请先登录」）。
+/// 这类错误既不能重试也不能当作坏页跳过，只能重新登录。
+pub(crate) fn is_login_expired_error(message: &str) -> bool {
+    ["请先登录", "未登录", "登录失效", "p_skey", "-3000"]
+        .iter()
+        .any(|keyword| message.contains(keyword))
+}
+
 pub(crate) fn feed_error_can_skip(error: &str) -> bool {
+    if is_login_expired_error(error) {
+        return false;
+    }
     error.contains("HTTP 5")
         || error.starts_with("解析空间动态失败：")
         || error.starts_with("QQ 空间动态接口返回错误")
@@ -1250,6 +1267,21 @@ mod tests {
         .is_some());
     }
 
+    #[test]
+    fn does_not_retry_real_qzone_login_required_response() {
+        // 2026-08 线上真实返回：code -3000 / message「请先登录」，不在旧名单里
+        assert!(retryable_response_reason(
+            StatusCode::OK,
+            r#"{"code":-3000,"message":"请先登录","subcode":-3000}"#,
+        )
+        .is_none());
+    }
+    #[test]
+    fn never_skips_login_expired_errors() {
+        assert!(!feed_error_can_skip("QQ 空间动态接口返回错误 -3000：请先登录"));
+        assert!(!feed_error_can_skip("登录失效（-3000：请先登录），请重新扫码登录后再点「开始归档」，已归档进度已保存"));
+        assert!(feed_error_can_skip("获取空间动态失败：HTTP 500 Internal Server Error"));
+    }
     #[test]
     fn does_not_retry_expired_login_response() {
         assert!(retryable_response_reason(
