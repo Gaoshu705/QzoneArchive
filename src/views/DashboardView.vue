@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { fetch } from "@tauri-apps/plugin-http";
+import { save } from "@tauri-apps/plugin-dialog";
 import { storeToRefs } from "pinia";
 import { useRouter } from "vue-router";
 import Button from "primevue/button";
@@ -9,7 +10,7 @@ import Tag from "primevue/tag";
 import QzoneText from "../components/QzoneText.vue";
 import StatCard from "../components/StatCard.vue";
 import { useAuthStore } from "../stores/auth";
-import { getArchiveOverview, getArchiveProgress, getInteractionRanking, listArchivedFeeds, type ArchiveItem, type ArchiveOverview, type ArchiveProgress, type InteractionRank } from "../utils/qzone";
+import { exportAllArchivedZip, getArchiveOverview, getArchiveProgress, getInteractionRanking, listArchivedFeeds, type ArchiveItem, type ArchiveOverview, type ArchiveProgress, type InteractionRank } from "../utils/qzone";
 
 const router = useRouter();
 const authStore = useAuthStore();
@@ -19,6 +20,9 @@ const progress = ref<ArchiveProgress>({ status: "idle", pages: 0, fetched: 0, sa
 const recent = ref<ArchiveItem[]>([]);
 const ranking = ref<InteractionRank[]>([]);
 const loading = ref(false);
+const exporting = ref(false);
+const exportMessage = ref("");
+const exportError = ref("");
 const avatarSources = reactive<Record<string, string>>({});
 const storageText = computed(() => overview.value.databaseBytes < 1024 * 1024 ? `${(overview.value.databaseBytes / 1024).toFixed(1)} KB` : `${(overview.value.databaseBytes / 1024 / 1024).toFixed(1)} MB`);
 const taskSeverity = computed(() => ({ completed: "success", running: "info", error: "danger", cancelled: "warn", limited: "warn", idle: "secondary" }[progress.value.status]));
@@ -57,6 +61,26 @@ async function loadDashboard() {
   } finally { loading.value = false; }
 }
 function primaryAction() { loggedIn.value ? router.push("/tasks") : authStore.openLogin(); }
+async function exportAll() {
+  if (exporting.value || !loggedIn.value || !overview.value.dynamics) return;
+  exporting.value = true;
+  exportMessage.value = "";
+  exportError.value = "";
+  try {
+    const date = new Date().toISOString().slice(0, 10);
+    const path = await save({
+      defaultPath: `QQ空间完整离线归档-${date}.zip`,
+      filters: [{ name: "ZIP 离线归档", extensions: ["zip"] }],
+    });
+    if (!path) return;
+    const result = await exportAllArchivedZip(path);
+    exportMessage.value = `完整离线归档已导出：${result.records} 条记录、${result.resources} 个资源${result.failed ? `，${result.failed} 个资源失败（详见压缩包内清单）` : ""}`;
+  } catch (reason) {
+    exportError.value = `完整离线归档导出失败：${String(reason)}`;
+  } finally {
+    exporting.value = false;
+  }
+}
 watch(loggedIn, loadDashboard);
 onMounted(loadDashboard);
 onBeforeUnmount(releaseAvatars);
@@ -65,8 +89,13 @@ onBeforeUnmount(releaseAvatars);
 <template>
   <section class="hero-panel">
     <div><span class="section-kicker">{{ loggedIn ? `QQ ${user?.uin}` : "开始使用" }}</span><h2>{{ loggedIn ? `${user?.nickname}，欢迎回来` : "把珍贵的空间记忆，安全保存在本地" }}</h2><p>{{ loggedIn ? `本地已保存 ${overview.dynamics} 条动态和 ${overview.pictures} 张图片。` : "登录 QQ 空间后，可以归档动态、图片、视频和互动记录。" }}</p></div>
-    <Button :label="loggedIn ? '开始归档' : '登录 QQ 空间'" :icon="loggedIn ? 'pi pi-download' : 'pi pi-link'" :loading="loading" @click="primaryAction" />
+    <div class="hero-actions">
+      <Button :label="loggedIn ? '开始归档' : '登录 QQ 空间'" :icon="loggedIn ? 'pi pi-download' : 'pi pi-link'" :loading="loading" @click="primaryAction" />
+      <Button v-if="loggedIn" label="导出归档" icon="pi pi-file-export" severity="secondary" outlined :loading="exporting" :disabled="!overview.dynamics || progress.status === 'running'" @click="exportAll" />
+    </div>
   </section>
+  <p v-if="exportMessage" class="dashboard-export-message"><i class="pi pi-check-circle" />{{ exportMessage }}</p>
+  <p v-if="exportError" class="dashboard-export-error"><i class="pi pi-exclamation-circle" />{{ exportError }}</p>
   <section class="stats-grid" aria-label="归档统计">
     <StatCard label="动态" :value="String(overview.dynamics)" :hint="overview.dynamics ? '当前账号本地归档' : '等待首次归档'" icon="pi pi-comment" tone="blue" />
     <StatCard label="照片" :value="String(overview.pictures)" :hint="overview.pictures ? '动态图片总数' : '暂无归档图片'" icon="pi pi-images" tone="purple" />

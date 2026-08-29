@@ -51,6 +51,7 @@ pub fn run() {
             archive::get_archived_feed,
             archive::count_archived_feeds,
             archive::export_archived_html,
+            archive::export_archived_zip,
             archive::load_archived_image,
             archive::load_archived_video,
             archive::get_archive_overview,

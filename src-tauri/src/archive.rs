@@ -1,7 +1,8 @@
 use std::{
-    collections::HashSet,
-    fs,
-    path::PathBuf,
+    collections::{HashMap, HashSet},
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Mutex,
@@ -13,6 +14,7 @@ use rusqlite::{params, Connection};
 use serde::Serialize;
 use serde_json::Value;
 use tauri::Manager;
+use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
 
 use crate::{qlogin::QLoginState, qzone};
 
@@ -82,6 +84,8 @@ pub struct ArchiveItem {
     owner_uin: String,
     id: i64,
     cell_id: String,
+    #[serde(skip)]
+    category: String,
     published_at: i64,
     content: Option<String>,
     author_uin: Option<String>,
@@ -124,6 +128,51 @@ pub struct ArchiveReply {
 pub struct LikeUser {
     uin: Option<String>,
     nickname: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OfflineExportResult {
+    records: usize,
+    resources: usize,
+    failed: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OfflineExportFailure {
+    resource_type: &'static str,
+    dynamic_id: Option<i64>,
+    source_url: String,
+    error: String,
+}
+
+struct OfflineResourceManifestEntry {
+    resource_key: String,
+    resource_type: &'static str,
+    source_url: String,
+}
+
+enum OfflineExportAsset {
+    Bytes {
+        zip_path: String,
+        bytes: Vec<u8>,
+    },
+    File {
+        zip_path: String,
+        source_path: PathBuf,
+    },
+}
+
+enum LocalizedOfflineResource {
+    Cached {
+        zip_path: String,
+        source_path: PathBuf,
+    },
+    Failed {
+        placeholder: String,
+        error: String,
+    },
 }
 
 #[derive(Serialize)]
@@ -322,6 +371,22 @@ fn open_database(app: &tauri::AppHandle) -> Result<Connection, String> {
            window_started_at INTEGER NOT NULL,
            requested_pages INTEGER NOT NULL DEFAULT 0
          );
+         CREATE TABLE IF NOT EXISTS archive_resource_cache (
+           owner_uin TEXT NOT NULL,
+           resource_key TEXT NOT NULL,
+           resource_type TEXT NOT NULL,
+           source_url TEXT NOT NULL,
+           local_path TEXT,
+           status TEXT NOT NULL DEFAULT 'pending',
+           mime_type TEXT,
+           file_size INTEGER,
+           error TEXT,
+           attempt_count INTEGER NOT NULL DEFAULT 0,
+           updated_at INTEGER NOT NULL,
+           PRIMARY KEY(owner_uin, resource_key)
+         );
+         CREATE INDEX IF NOT EXISTS idx_archive_resource_cache_status
+           ON archive_resource_cache(owner_uin, status, resource_type);
          CREATE TABLE IF NOT EXISTS archive_skips (
            id INTEGER PRIMARY KEY AUTOINCREMENT,
            owner_uin TEXT NOT NULL,
@@ -890,7 +955,7 @@ fn save_original_dynamic(
     let content = if is_guestbook {
         text_at(feed, "/summary/summary")
     } else {
-        text_at(original, "/cell_summary/summary")
+        dynamic_content_from_original(original)
     };
     let author_uin = if is_guestbook {
         text_at(feed, "/userinfo/user/uin")
@@ -922,13 +987,47 @@ fn save_original_dynamic(
          (owner_uin,cell_id,published_at,content,author_uin,author_name,category,pictures_json,video_json,raw_original_json,archived_at)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
          ON CONFLICT(owner_uin,cell_id) DO UPDATE SET
-          published_at=excluded.published_at,content=excluded.content,author_uin=excluded.author_uin,
+          published_at=excluded.published_at,
+          content=CASE
+            WHEN excluded.content IS NULL OR trim(excluded.content)='' THEN archive_dynamics.content
+            WHEN archive_dynamics.content IS NULL OR trim(archive_dynamics.content)='' THEN excluded.content
+            WHEN (rtrim(excluded.content) LIKE '%...' OR rtrim(excluded.content) LIKE '%…')
+              AND rtrim(archive_dynamics.content) NOT LIKE '%...'
+              AND rtrim(archive_dynamics.content) NOT LIKE '%…' THEN archive_dynamics.content
+            WHEN length(excluded.content)>length(archive_dynamics.content) THEN excluded.content
+            ELSE archive_dynamics.content
+          END,
+          author_uin=excluded.author_uin,
           author_name=excluded.author_name,category=excluded.category,pictures_json=COALESCE(excluded.pictures_json,archive_dynamics.pictures_json),
           video_json=COALESCE(excluded.video_json,archive_dynamics.video_json),
           raw_original_json=excluded.raw_original_json,archived_at=excluded.archived_at",
         params![owner_uin,cell_id,published_at,content,author_uin,author_name,category,pictures_json,video_json,original.to_string(),now()],
     ).map_err(|error| format!("保存原动态失败：{error}"))?;
     Ok(())
+}
+
+fn dynamic_content_from_original(original: &Value) -> Option<String> {
+    [
+        "/content",
+        "/cell_summary/content",
+        "/cell_summary/full_summary",
+        "/cell_summary/summary",
+    ]
+    .into_iter()
+    .filter_map(|path| text_at(original, path))
+    .filter(|value| !value.trim().is_empty())
+    .max_by(|left, right| {
+        let left_complete = !content_looks_truncated(left);
+        let right_complete = !content_looks_truncated(right);
+        left_complete
+            .cmp(&right_complete)
+            .then_with(|| left.chars().count().cmp(&right.chars().count()))
+    })
+}
+
+fn content_looks_truncated(value: &str) -> bool {
+    let value = value.trim_end();
+    value.ends_with("...") || value.ends_with('…')
 }
 
 fn picture_url_candidates(json: Option<String>) -> Vec<Vec<String>> {
@@ -1011,16 +1110,17 @@ fn archived_image_extension(bytes: &[u8]) -> Option<&'static str> {
 }
 
 fn is_qq_missing_image_placeholder(bytes: &[u8]) -> bool {
+    is_qq_missing_image_placeholder_with_len(bytes, bytes.len() as u64)
+}
+
+fn is_qq_missing_image_placeholder_with_len(bytes: &[u8], length: u64) -> bool {
     bytes.get(6..10).is_some_and(|size| {
         let width = u16::from_le_bytes([size[0], size[1]]);
         let height = u16::from_le_bytes([size[2], size[3]]);
-        (bytes.len() == 2_038 && bytes.starts_with(b"GIF89a") && width == 340 && height == 320)
-            || (bytes.len() == 2_687
-                && bytes.starts_with(b"GIF89a")
-                && width == 340
-                && height == 320)
-            || (bytes.len() == 1_643 && bytes.starts_with(b"GIF87a") && width == 99 && height == 99)
-            || (bytes.len() == 1_547 && bytes.starts_with(b"GIF87a") && width == 98 && height == 98)
+        (length == 2_038 && bytes.starts_with(b"GIF89a") && width == 340 && height == 320)
+            || (length == 2_687 && bytes.starts_with(b"GIF89a") && width == 340 && height == 320)
+            || (length == 1_643 && bytes.starts_with(b"GIF87a") && width == 99 && height == 99)
+            || (length == 1_547 && bytes.starts_with(b"GIF87a") && width == 98 && height == 98)
     })
 }
 
@@ -1042,6 +1142,142 @@ fn existing_archived_image(image_dir: &std::path::Path, file_stem: &str) -> Opti
             }
             Some(path)
         })
+}
+
+const ARCHIVE_RESOURCE_ATTEMPTS: u32 = 5;
+
+fn archive_resource_retry_delay(attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_millis(1_500 * 2_u64.pow(attempt.saturating_sub(1)))
+}
+
+fn archive_resource_status_is_retryable(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+struct DownloadedArchiveResource {
+    bytes: Vec<u8>,
+    content_type: String,
+}
+
+struct ArchiveResourceDownloadError {
+    message: String,
+    transient_exhausted: bool,
+    forbidden: bool,
+}
+
+#[derive(Default)]
+struct ArchiveResourceRetryBudget {
+    attempts: u32,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn download_archive_resource(
+    client: &reqwest::Client,
+    url: &str,
+    user_agent: &str,
+    cookie_header: Option<&str>,
+    with_referer: bool,
+    accept: &str,
+    resource_name: &str,
+    max_bytes: u64,
+    retry_budget: &mut ArchiveResourceRetryBudget,
+) -> Result<DownloadedArchiveResource, ArchiveResourceDownloadError> {
+    let mut last_error = String::new();
+    loop {
+        if retry_budget.attempts >= ARCHIVE_RESOURCE_ATTEMPTS {
+            return Err(ArchiveResourceDownloadError {
+                message: if last_error.is_empty() {
+                    format!("{resource_name}已达到最多 {ARCHIVE_RESOURCE_ATTEMPTS} 次尝试")
+                } else {
+                    last_error
+                },
+                transient_exhausted: true,
+                forbidden: false,
+            });
+        }
+        retry_budget.attempts += 1;
+        let attempt = retry_budget.attempts;
+        let mut request = client
+            .get(url)
+            .header(reqwest::header::USER_AGENT, user_agent)
+            .header(reqwest::header::ACCEPT, accept)
+            .header(
+                reqwest::header::ACCEPT_LANGUAGE,
+                "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,zh-TW;q=0.5",
+            );
+        if let Some(cookie_header) = cookie_header.filter(|value| !value.is_empty()) {
+            request = request.header(reqwest::header::COOKIE, cookie_header);
+        }
+        if with_referer {
+            request = request.header(reqwest::header::REFERER, "https://user.qzone.qq.com/");
+        }
+        match request.send().await {
+            Ok(response) => {
+                let status = response.status();
+                if archive_resource_status_is_retryable(status) {
+                    last_error = format!(
+                        "请求{resource_name}失败：HTTP {status}（第 {attempt}/{ARCHIVE_RESOURCE_ATTEMPTS} 次）"
+                    );
+                } else if !status.is_success() {
+                    return Err(ArchiveResourceDownloadError {
+                        message: format!("HTTP {status}"),
+                        transient_exhausted: false,
+                        forbidden: status == reqwest::StatusCode::FORBIDDEN,
+                    });
+                } else if response
+                    .content_length()
+                    .is_some_and(|length| length > max_bytes)
+                {
+                    return Err(ArchiveResourceDownloadError {
+                        message: format!(
+                            "{resource_name}超过 {} MB 安全限制",
+                            max_bytes / 1024 / 1024
+                        ),
+                        transient_exhausted: false,
+                        forbidden: false,
+                    });
+                } else {
+                    let content_type = response
+                        .headers()
+                        .get(reqwest::header::CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    match response.bytes().await {
+                        Ok(bytes) if bytes.len() as u64 <= max_bytes => {
+                            return Ok(DownloadedArchiveResource {
+                                bytes: bytes.to_vec(),
+                                content_type,
+                            });
+                        }
+                        Ok(_) => {
+                            return Err(ArchiveResourceDownloadError {
+                                message: format!(
+                                    "{resource_name}超过 {} MB 安全限制",
+                                    max_bytes / 1024 / 1024
+                                ),
+                                transient_exhausted: false,
+                                forbidden: false,
+                            });
+                        }
+                        Err(error) => {
+                            last_error = format!(
+                                "读取{resource_name}数据失败（第 {attempt}/{ARCHIVE_RESOURCE_ATTEMPTS} 次）：{error}"
+                            );
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                last_error = format!(
+                    "请求{resource_name}失败（第 {attempt}/{ARCHIVE_RESOURCE_ATTEMPTS} 次）：{error}"
+                );
+            }
+        }
+        if attempt < ARCHIVE_RESOURCE_ATTEMPTS {
+            tokio::time::sleep(archive_resource_retry_delay(attempt)).await;
+        }
+    }
 }
 
 #[tauri::command]
@@ -1097,65 +1333,56 @@ pub async fn load_archived_image(
         .build()
         .map_err(|error| format!("创建图片请求客户端失败：{error}"))?;
     let mut last_error = String::new();
-    for url in candidates {
+    let mut retry_budget = ArchiveResourceRetryBudget::default();
+    'candidate: for url in candidates {
         for (with_cookie, with_referer) in
             [(true, true), (true, false), (false, true), (false, false)]
         {
-            let mut request = client
-                .get(&url)
-                .header(reqwest::header::USER_AGENT, &auth.user_agent)
-                .header(
-                    reqwest::header::ACCEPT,
-                    "image/avif,image/webp,image/png,image/jpeg,image/*,*/*;q=0.8",
-                )
-                .header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,zh-TW;q=0.5");
-            if with_cookie {
-                request = request.header(reqwest::header::COOKIE, &auth.cookie_header);
-            }
-            if with_referer {
-                request = request.header(reqwest::header::REFERER, "https://user.qzone.qq.com/");
-            }
-            match request.send().await {
-                Ok(response) if response.status().is_success() => {
-                    if response
-                        .content_length()
-                        .is_some_and(|length| length > 50 * 1024 * 1024)
-                    {
-                        last_error = "图片超过 50 MB 安全限制".into();
+            match download_archive_resource(
+                &client,
+                &url,
+                &auth.user_agent,
+                with_cookie.then_some(auth.cookie_header.as_str()),
+                with_referer,
+                "image/avif,image/webp,image/png,image/jpeg,image/*,*/*;q=0.8",
+                "图片",
+                50 * 1024 * 1024,
+                &mut retry_budget,
+            )
+            .await
+            {
+                Ok(download) => {
+                    let Some(extension) = archived_image_extension(&download.bytes) else {
+                        last_error = "QQ 返回了非图片内容".into();
+                        continue;
+                    };
+                    if is_qq_missing_image_placeholder(&download.bytes) {
+                        last_error = "QQ 返回了图片不存在占位图".into();
                         continue;
                     }
-                    match response.bytes().await {
-                        Ok(bytes) => {
-                            let Some(extension) = archived_image_extension(&bytes) else {
-                                last_error = "QQ 返回了非图片内容".into();
-                                continue;
-                            };
-                            if is_qq_missing_image_placeholder(&bytes) {
-                                last_error = "QQ 返回了图片不存在占位图".into();
-                                continue;
-                            }
-                            let path = image_dir.join(format!("{file_stem}.{extension}"));
-                            let nonce = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_nanos();
-                            let temporary = image_dir.join(format!("{file_stem}-{nonce}.part"));
-                            fs::write(&temporary, &bytes)
-                                .map_err(|error| format!("写入图片归档失败：{error}"))?;
-                            if let Err(error) = fs::rename(&temporary, &path) {
-                                if !path.exists() {
-                                    let _ = fs::remove_file(&temporary);
-                                    return Err(format!("保存图片归档失败：{error}"));
-                                }
-                                let _ = fs::remove_file(&temporary);
-                            }
-                            return Ok(path.to_string_lossy().into_owned());
+                    let path = image_dir.join(format!("{file_stem}.{extension}"));
+                    let nonce = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos();
+                    let temporary = image_dir.join(format!("{file_stem}-{nonce}.part"));
+                    fs::write(&temporary, &download.bytes)
+                        .map_err(|error| format!("写入图片归档失败：{error}"))?;
+                    if let Err(error) = fs::rename(&temporary, &path) {
+                        if !path.exists() {
+                            let _ = fs::remove_file(&temporary);
+                            return Err(format!("保存图片归档失败：{error}"));
                         }
-                        Err(error) => last_error = format!("读取图片数据失败：{error}"),
+                        let _ = fs::remove_file(&temporary);
+                    }
+                    return Ok(path.to_string_lossy().into_owned());
+                }
+                Err(error) => {
+                    last_error = error.message;
+                    if error.transient_exhausted {
+                        continue 'candidate;
                     }
                 }
-                Ok(response) => last_error = format!("HTTP {}", response.status()),
-                Err(error) => last_error = format!("请求图片失败：{error}"),
             }
         }
     }
@@ -1243,62 +1470,53 @@ pub async fn load_archived_video(
         .map_err(|error| format!("创建视频请求客户端失败：{error}"))?;
     let mut last_error = String::new();
     let mut rejected = false;
-    for url in candidates {
+    let mut retry_budget = ArchiveResourceRetryBudget::default();
+    'candidate: for url in candidates {
         for (with_cookie, with_referer) in
             [(true, true), (true, false), (false, true), (false, false)]
         {
-            let mut request = client
-                .get(&url)
-                .header(reqwest::header::USER_AGENT, &auth.user_agent)
-                .header(
-                    reqwest::header::ACCEPT,
-                    "video/mp4,video/*;q=0.9,application/octet-stream;q=0.8,*/*;q=0.5",
-                )
-                .header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6,zh-TW;q=0.5");
-            if with_cookie {
-                request = request.header(reqwest::header::COOKIE, &auth.cookie_header);
-            }
-            if with_referer {
-                request = request.header(reqwest::header::REFERER, "https://user.qzone.qq.com/");
-            }
-            match request.send().await {
-                Ok(response) if response.status().is_success() => {
-                    let content_type = response
-                        .headers()
-                        .get(reqwest::header::CONTENT_TYPE)
-                        .and_then(|value| value.to_str().ok())
-                        .unwrap_or("")
-                        .to_ascii_lowercase();
-                    match response.bytes().await {
-                        Ok(bytes) => {
-                            let is_mp4 = bytes
-                                .get(4..12)
-                                .is_some_and(|value| value.windows(4).any(|part| part == b"ftyp"));
-                            if content_type.starts_with("video/")
-                                || content_type.contains("octet-stream")
-                                || is_mp4
-                            {
-                                fs::write(&cache_path, &bytes)
-                                    .map_err(|error| format!("写入视频缓存失败：{error}"))?;
-                                return Ok(cache_path.to_string_lossy().into_owned());
-                            }
-                            last_error = format!(
-                                "QQ 返回了非视频内容（{}）",
-                                if content_type.is_empty() {
-                                    "未知类型"
-                                } else {
-                                    &content_type
-                                }
-                            );
+            match download_archive_resource(
+                &client,
+                &url,
+                &auth.user_agent,
+                with_cookie.then_some(auth.cookie_header.as_str()),
+                with_referer,
+                "video/mp4,video/*;q=0.9,application/octet-stream;q=0.8,*/*;q=0.5",
+                "视频",
+                u64::MAX,
+                &mut retry_budget,
+            )
+            .await
+            {
+                Ok(download) => {
+                    let is_mp4 = download
+                        .bytes
+                        .get(4..12)
+                        .is_some_and(|value| value.windows(4).any(|part| part == b"ftyp"));
+                    if download.content_type.starts_with("video/")
+                        || download.content_type.contains("octet-stream")
+                        || is_mp4
+                    {
+                        fs::write(&cache_path, &download.bytes)
+                            .map_err(|error| format!("写入视频缓存失败：{error}"))?;
+                        return Ok(cache_path.to_string_lossy().into_owned());
+                    }
+                    last_error = format!(
+                        "QQ 返回了非视频内容（{}）",
+                        if download.content_type.is_empty() {
+                            "未知类型"
+                        } else {
+                            &download.content_type
                         }
-                        Err(error) => last_error = format!("读取视频数据失败：{error}"),
+                    );
+                }
+                Err(error) => {
+                    rejected |= error.forbidden;
+                    last_error = error.message;
+                    if error.transient_exhausted {
+                        continue 'candidate;
                     }
                 }
-                Ok(response) => {
-                    rejected |= response.status() == reqwest::StatusCode::FORBIDDEN;
-                    last_error = format!("HTTP {}", response.status());
-                }
-                Err(error) => last_error = format!("请求视频失败：{error}"),
             }
         }
     }
@@ -1875,7 +2093,8 @@ pub async fn retry_all_archive_skips(
                 });
             }
             Err(error) => {
-                if error.starts_with("请求频率保护中") || error.starts_with("归档任务运行中") {
+                if error.starts_with("请求频率保护中") || error.starts_with("归档任务运行中")
+                {
                     break;
                 }
                 result.failed += 1;
@@ -1998,32 +2217,35 @@ pub async fn list_archived_feeds(
     let connection = open_database(&app)?;
     let mut statement = connection
         .prepare(
-            "SELECT d.id,d.owner_uin,d.cell_id,d.published_at,d.content,d.author_uin,d.author_name,d.pictures_json,d.video_json,
+            "SELECT d.id,d.owner_uin,d.cell_id,d.category,d.published_at,d.content,d.author_uin,d.author_name,d.pictures_json,d.video_json,
               (SELECT COUNT(*) FROM archive_feeds f WHERE f.owner_uin=d.owner_uin AND f.cell_id=d.cell_id AND f.event_type=217),
               (SELECT COUNT(*) FROM archive_feeds f WHERE f.owner_uin=d.owner_uin AND f.cell_id=d.cell_id AND f.event_type IN (2,311))
-             FROM archive_dynamics d WHERE d.owner_uin=?1 AND d.category=?2 ORDER BY d.published_at ASC LIMIT ?3 OFFSET ?4",
+             FROM archive_dynamics d
+             WHERE d.owner_uin=?1 AND (?2='all' OR d.category=?2)
+             ORDER BY d.published_at ASC LIMIT ?3 OFFSET ?4",
         )
         .map_err(|error| format!("读取归档失败：{error}"))?;
     let rows = statement
         .query_map(
             params![owner_uin, category, limit.clamp(1, 200), offset],
             |row| {
-                let video_json = row.get::<_, Option<String>>(8)?;
+                let video_json = row.get::<_, Option<String>>(9)?;
                 let video_urls = video_urls(video_json.clone());
                 Ok(ArchiveItem {
                     id: row.get(0)?,
                     owner_uin: row.get(1)?,
                     cell_id: row.get(2)?,
-                    published_at: row.get(3)?,
-                    content: row.get(4)?,
-                    author_uin: row.get(5)?,
-                    author_name: row.get(6)?,
-                    picture_urls: picture_urls(row.get(7)?),
+                    category: row.get(3)?,
+                    published_at: row.get(4)?,
+                    content: row.get(5)?,
+                    author_uin: row.get(6)?,
+                    author_name: row.get(7)?,
+                    picture_urls: picture_urls(row.get(8)?),
                     video_url: video_urls.first().cloned(),
                     video_urls,
                     video_cover_url: video_cover_url(video_json),
-                    like_count: row.get(9)?,
-                    comment_count: row.get(10)?,
+                    like_count: row.get(10)?,
+                    comment_count: row.get(11)?,
                     likes: vec![],
                     comments: vec![],
                 })
@@ -2174,17 +2396,17 @@ pub async fn get_archived_feed(
     let owner_uin = login.qzone_auth().await?.uin;
     let connection = open_database(&app)?;
     let mut item = connection.query_row(
-        "SELECT d.id,d.owner_uin,d.cell_id,d.published_at,d.content,d.author_uin,d.author_name,d.pictures_json,d.video_json,
+        "SELECT d.id,d.owner_uin,d.cell_id,d.category,d.published_at,d.content,d.author_uin,d.author_name,d.pictures_json,d.video_json,
           (SELECT COUNT(*) FROM archive_feeds f WHERE f.owner_uin=d.owner_uin AND f.cell_id=d.cell_id AND f.event_type=217),
           (SELECT COUNT(*) FROM archive_feeds f WHERE f.owner_uin=d.owner_uin AND f.cell_id=d.cell_id AND f.event_type IN (2,311))
          FROM archive_dynamics d WHERE d.owner_uin=?1 AND d.id=?2",
         params![owner_uin, id], |row| {
-            let video_json = row.get::<_, Option<String>>(8)?;
+            let video_json = row.get::<_, Option<String>>(9)?;
             let video_urls = video_urls(video_json.clone());
-            Ok(ArchiveItem { id: row.get(0)?, owner_uin: row.get(1)?, cell_id: row.get(2)?, published_at: row.get(3)?,
-                content: row.get(4)?, author_uin: row.get(5)?, author_name: row.get(6)?, picture_urls: picture_urls(row.get(7)?),
+            Ok(ArchiveItem { id: row.get(0)?, owner_uin: row.get(1)?, cell_id: row.get(2)?, category: row.get(3)?, published_at: row.get(4)?,
+                content: row.get(5)?, author_uin: row.get(6)?, author_name: row.get(7)?, picture_urls: picture_urls(row.get(8)?),
                 video_url: video_urls.first().cloned(), video_urls, video_cover_url: video_cover_url(video_json),
-                like_count: row.get(9)?, comment_count: row.get(10)?, likes: vec![], comments: vec![] })
+                like_count: row.get(10)?, comment_count: row.get(11)?, likes: vec![], comments: vec![] })
         },
     ).map_err(|error| match error { rusqlite::Error::QueryReturnedNoRows => "原始动态不存在或已删除".into(), _ => format!("读取原始动态失败：{error}") })?;
     let mut comments = connection
@@ -2193,18 +2415,20 @@ pub async fn get_archived_feed(
          WHERE owner_uin=?1 AND cell_id=?2 AND event_type IN (2,311) ORDER BY event_time ASC",
         )
         .map_err(|error| format!("准备评论查询失败：{error}"))?;
-    item.comments = merge_comments(comments
-        .query_map(params![item.owner_uin, item.cell_id], |row| {
-            Ok(comment_from_values(
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-            ))
-        })
-        .map_err(|error| format!("查询动态评论失败：{error}"))?
-        .filter_map(Result::ok));
+    item.comments = merge_comments(
+        comments
+            .query_map(params![item.owner_uin, item.cell_id], |row| {
+                Ok(comment_from_values(
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .map_err(|error| format!("查询动态评论失败：{error}"))?
+            .filter_map(Result::ok),
+    );
     drop(comments);
     let mut likes_stmt = connection
         .prepare(
@@ -2370,8 +2594,17 @@ fn merge_comments(comments: impl IntoIterator<Item = ArchiveComment>) -> Vec<Arc
 
 fn validate_category(category: &str) -> Result<(), String> {
     match category {
-        "self" | "other" | "guestbook" => Ok(()),
+        "self" | "other" | "guestbook" | "all" => Ok(()),
         _ => Err("无效的归档分类".into()),
+    }
+}
+
+fn archive_category_name(category: &str) -> &'static str {
+    match category {
+        "self" => "本人动态",
+        "other" => "其他动态",
+        "guestbook" => "留言",
+        _ => "全部归档",
     }
 }
 
@@ -2384,23 +2617,49 @@ fn html_escape(value: &str) -> String {
         .replace('\'', "&#39;")
 }
 
+const QZONE_EMOJI_BASE_URL: &str = "https://qzonestyle.gtimg.cn/qzone/em";
+
+fn qzone_emoji_url(code: &str, extension: &str) -> String {
+    format!("{QZONE_EMOJI_BASE_URL}/{code}.{extension}")
+}
+
+fn qzone_emoji_codes(value: &str) -> Vec<String> {
+    let pattern = regex::Regex::new(r"\[em\](e\d+)\[/em\]").expect("fixed emoji regex");
+    pattern
+        .captures_iter(value)
+        .map(|captures| captures[1].to_owned())
+        .collect()
+}
+
 fn qzone_text_html(value: Option<&str>) -> String {
     let text = value
         .unwrap_or("")
         .trim_start_matches(['：', ':'])
         .trim_start();
     let pattern =
-        regex::Regex::new(r"@\{uin:([^,}]+),nick:([^}]+)\}").expect("fixed mention regex");
+        regex::Regex::new(r"@\{uin:([^,}]+),nick:([^,}]+)(?:,[^}]*)?\}|\[em\](e\d+)\[/em\]")
+            .expect("fixed qzone text regex");
     let mut html = String::new();
     let mut cursor = 0;
     for captures in pattern.captures_iter(text) {
         let matched = captures.get(0).expect("full capture");
         html.push_str(&html_escape(&text[cursor..matched.start()]));
-        html.push_str("<span class=\"mention\" title=\"QQ ");
-        html.push_str(&html_escape(&captures[1]));
-        html.push_str("\">@");
-        html.push_str(&html_escape(&captures[2]));
-        html.push_str("</span>");
+        if let Some(code) = captures.get(3) {
+            let code = code.as_str();
+            html.push_str("<img class=\"qzone-emoji\" src=\"");
+            html.push_str(&qzone_emoji_url(code, "gif"));
+            html.push_str("\" alt=\"[QQ 表情 ");
+            html.push_str(&html_escape(code));
+            html.push_str("]\" title=\"QQ 表情 ");
+            html.push_str(&html_escape(code));
+            html.push_str("\">");
+        } else {
+            html.push_str("<span class=\"mention\" title=\"QQ ");
+            html.push_str(&html_escape(&captures[1]));
+            html.push_str("\">@");
+            html.push_str(&html_escape(&captures[2]));
+            html.push_str("</span>");
+        }
         cursor = matched.end();
     }
     html.push_str(&html_escape(&text[cursor..]));
@@ -2411,6 +2670,24 @@ fn qzone_text_html(value: Option<&str>) -> String {
     }
 }
 
+fn archive_emoji_codes(items: &[ArchiveItem]) -> Vec<String> {
+    let mut codes = HashSet::new();
+    for item in items {
+        if let Some(content) = item.content.as_deref() {
+            codes.extend(qzone_emoji_codes(content));
+        }
+        for comment in &item.comments {
+            codes.extend(qzone_emoji_codes(&comment.content));
+            for reply in &comment.replies {
+                codes.extend(qzone_emoji_codes(&reply.content));
+            }
+        }
+    }
+    let mut codes = codes.into_iter().collect::<Vec<_>>();
+    codes.sort_unstable();
+    codes
+}
+
 fn archive_items_for_export(
     connection: &Connection,
     owner_uin: &str,
@@ -2418,29 +2695,32 @@ fn archive_items_for_export(
     selected_ids: Option<&HashSet<i64>>,
 ) -> Result<Vec<ArchiveItem>, String> {
     let mut statement = connection.prepare(
-        "SELECT d.id,d.owner_uin,d.cell_id,d.published_at,d.content,d.author_uin,d.author_name,d.pictures_json,d.video_json,
+        "SELECT d.id,d.owner_uin,d.cell_id,d.category,d.published_at,d.content,d.author_uin,d.author_name,d.pictures_json,d.video_json,
           (SELECT COUNT(*) FROM archive_feeds f WHERE f.owner_uin=d.owner_uin AND f.cell_id=d.cell_id AND f.event_type=217),
           (SELECT COUNT(*) FROM archive_feeds f WHERE f.owner_uin=d.owner_uin AND f.cell_id=d.cell_id AND f.event_type IN (2,311))
-         FROM archive_dynamics d WHERE d.owner_uin=?1 AND d.category=?2 ORDER BY d.published_at ASC"
+         FROM archive_dynamics d
+         WHERE d.owner_uin=?1 AND (?2='all' OR d.category=?2)
+         ORDER BY d.published_at ASC"
     ).map_err(|error| format!("准备导出查询失败：{error}"))?;
     let rows = statement
         .query_map(params![owner_uin, category], |row| {
-            let video_json = row.get::<_, Option<String>>(8)?;
+            let video_json = row.get::<_, Option<String>>(9)?;
             let video_urls = video_urls(video_json.clone());
             Ok(ArchiveItem {
                 id: row.get(0)?,
                 owner_uin: row.get(1)?,
                 cell_id: row.get(2)?,
-                published_at: row.get(3)?,
-                content: row.get(4)?,
-                author_uin: row.get(5)?,
-                author_name: row.get(6)?,
-                picture_urls: picture_urls(row.get(7)?),
+                category: row.get(3)?,
+                published_at: row.get(4)?,
+                content: row.get(5)?,
+                author_uin: row.get(6)?,
+                author_name: row.get(7)?,
+                picture_urls: picture_urls(row.get(8)?),
                 video_url: video_urls.first().cloned(),
                 video_urls,
                 video_cover_url: video_cover_url(video_json),
-                like_count: row.get(9)?,
-                comment_count: row.get(10)?,
+                like_count: row.get(10)?,
+                comment_count: row.get(11)?,
                 likes: vec![],
                 comments: vec![],
             })
@@ -2512,10 +2792,18 @@ pub async fn export_archived_html(
     if items.is_empty() {
         return Err("当前分类没有可以导出的归档".into());
     }
-    let category_name = match category.as_str() {
-        "self" => "本人动态",
-        "other" => "其他动态",
-        _ => "留言",
+    let category_name = archive_category_name(&category);
+    let category_tabs = if category == "all" {
+        let count = |value: &str| items.iter().filter(|item| item.category == value).count();
+        format!(
+            "<nav class=\"archive-tabs\" role=\"tablist\" aria-label=\"归档分类\"><button type=\"button\" class=\"archive-tab active\" role=\"tab\" aria-selected=\"true\" data-filter=\"all\">全部 <b>{}</b></button><button type=\"button\" class=\"archive-tab\" role=\"tab\" aria-selected=\"false\" data-filter=\"self\">本人动态 <b>{}</b></button><button type=\"button\" class=\"archive-tab\" role=\"tab\" aria-selected=\"false\" data-filter=\"other\">其他动态 <b>{}</b></button><button type=\"button\" class=\"archive-tab\" role=\"tab\" aria-selected=\"false\" data-filter=\"guestbook\">留言 <b>{}</b></button></nav>",
+            items.len(),
+            count("self"),
+            count("other"),
+            count("guestbook")
+        )
+    } else {
+        String::new()
     };
     let mut cards = String::new();
     for item in &items {
@@ -2524,14 +2812,18 @@ pub async fn export_archived_html(
             .as_deref()
             .or(item.author_uin.as_deref())
             .unwrap_or("QQ 用户");
-        cards.push_str("<article class=\"card\"><header><img class=\"avatar\" src=\"https://qlogo2.store.qq.com/qzone/");
+        cards.push_str("<article class=\"card\" data-category=\"");
+        cards.push_str(&html_escape(&item.category));
+        cards.push_str("\"><header><img class=\"avatar\" src=\"https://qlogo2.store.qq.com/qzone/");
         let uin = item.author_uin.as_deref().unwrap_or("0");
         cards.push_str(&html_escape(uin));
         cards.push('/');
         cards.push_str(&html_escape(uin));
         cards.push_str("/50\"><div><strong>");
         cards.push_str(&html_escape(author));
-        cards.push_str("</strong><small>");
+        cards.push_str("</strong><small><span class=\"category-badge\">");
+        cards.push_str(archive_category_name(&item.category));
+        cards.push_str("</span> · ");
         if let Some(author_uin) = &item.author_uin {
             cards.push_str("QQ ");
             cards.push_str(&html_escape(author_uin));
@@ -2633,10 +2925,907 @@ pub async fn export_archived_html(
         cards.push_str("</article>");
     }
     Ok(format!(
-        r#"<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>QQ空间归档 - {category_name}</title><style>*{{box-sizing:border-box}}body{{margin:0;background:#f3f6fb;color:#243247;font:14px/1.7 system-ui,-apple-system,"Microsoft YaHei",sans-serif}}main{{width:min(820px,calc(100% - 24px));margin:30px auto}}h1{{margin:0}}.intro{{color:#758298;margin:0 0 20px}}.card{{background:#fff;border:1px solid #e5eaf2;border-radius:16px;padding:20px;margin:14px 0;box-shadow:0 8px 25px #2038580b}}header{{display:flex;gap:11px;align-items:center}}.avatar{{width:44px;height:44px;border-radius:50%}}header strong,header small{{display:block}}small,.muted,.stats{{color:#7e899a}}.content{{margin:14px 0;white-space:pre-wrap;overflow-wrap:anywhere}}.mention,a{{color:#2684ff}}.pictures{{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}}.pictures img{{display:block;width:100%;height:210px;object-fit:cover;border-radius:8px}}.video{{display:inline-block;padding:7px 12px;background:#edf5ff;border-radius:9px;text-decoration:none}}.stats{{margin-top:12px}}.comments{{margin-top:12px;padding:12px;background:#f6f8fb;border-radius:10px}}.comment{{margin:8px 0}}.comment-meta{{margin-bottom:3px;color:#7e899a;font-size:11px}}.comment-meta b{{color:#2684ff}}.replies{{margin:6px 0 0 18px;padding:7px 10px;border-left:2px solid #c9dcf6;background:#fff;border-radius:0 7px 7px 0}}@media(max-width:600px){{main{{margin:16px auto}}.card{{padding:15px}}.pictures img{{height:125px}}}}</style></head><body><main><h1>QQ空间归档 · {category_name}</h1><p class="intro">账号 {owner} · 共 {count} 条 · 导出时间 <span id="export-time"></span></p>{cards}</main><script>document.querySelector('#export-time').textContent=new Date().toLocaleString();document.querySelectorAll('time[data-time]').forEach(e=>e.textContent=new Date(Number(e.dataset.time)*1000).toLocaleString());</script></body></html>"#,
+        r#"<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>QQ空间归档 - {category_name}</title><style>*{{box-sizing:border-box}}body{{margin:0;background:#f3f6fb;color:#243247;font:14px/1.7 system-ui,-apple-system,"Segoe UI","Microsoft YaHei","Segoe UI Emoji","Apple Color Emoji","Noto Color Emoji",sans-serif}}main{{width:min(820px,calc(100% - 24px));margin:30px auto}}h1{{margin:0}}.intro{{color:#758298;margin:0 0 20px}}.archive-tabs{{position:sticky;z-index:10;top:0;display:flex;gap:7px;margin:0 0 18px;padding:10px;background:rgba(243,246,251,.94);border:1px solid #e1e7f0;border-radius:14px;backdrop-filter:blur(12px)}}.archive-tab{{flex:1;padding:9px 10px;color:#64748b;background:#fff;border:1px solid #dde5ef;border-radius:10px;cursor:pointer;font:inherit;font-weight:600;white-space:nowrap}}.archive-tab b{{margin-left:3px;color:#8b98aa;font-size:11px}}.archive-tab.active{{color:#fff;background:#2684ff;border-color:#2684ff}}.archive-tab.active b{{color:#dcecff}}.card{{background:#fff;border:1px solid #e5eaf2;border-radius:16px;padding:20px;margin:14px 0;box-shadow:0 8px 25px #2038580b}}.card[hidden]{{display:none}}header{{display:flex;gap:11px;align-items:center}}.avatar{{width:44px;height:44px;border-radius:50%}}header strong,header small{{display:block}}small,.muted,.stats{{color:#7e899a}}.category-badge{{color:#2684ff}}.content{{margin:14px 0;white-space:pre-wrap;overflow-wrap:anywhere}}.mention,a{{color:#2684ff}}.qzone-emoji{{display:inline-block;width:24px;height:24px;object-fit:contain;vertical-align:-6px;margin:0 1px}}.pictures{{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}}.pictures img{{display:block;width:100%;height:210px;object-fit:cover;border-radius:8px}}.video{{display:inline-block;padding:7px 12px;background:#edf5ff;border-radius:9px;text-decoration:none}}.stats{{margin-top:12px}}.comments{{margin-top:12px;padding:12px;background:#f6f8fb;border-radius:10px}}.comment{{margin:8px 0}}.comment-meta{{margin-bottom:3px;color:#7e899a;font-size:11px}}.comment-meta b{{color:#2684ff}}.replies{{margin:6px 0 0 18px;padding:7px 10px;border-left:2px solid #c9dcf6;background:#fff;border-radius:0 7px 7px 0}}@media(max-width:600px){{main{{margin:16px auto}}.archive-tabs{{overflow-x:auto}}.archive-tab{{min-width:max-content}}.card{{padding:15px}}.pictures img{{height:125px}}}}</style></head><body><main><h1>QQ空间归档 · {category_name}</h1><p class="intro">账号 {owner} · 共 <span id="visible-count">{count}</span> 条 · 导出时间 <span id="export-time"></span></p>{category_tabs}{cards}</main><script>document.querySelector('#export-time').textContent=new Date().toLocaleString();document.querySelectorAll('time[data-time]').forEach(e=>e.textContent=new Date(Number(e.dataset.time)*1000).toLocaleString());const tabs=[...document.querySelectorAll('.archive-tab')],cards=[...document.querySelectorAll('.card')],visibleCount=document.querySelector('#visible-count');tabs.forEach(tab=>tab.addEventListener('click',()=>{{const filter=tab.dataset.filter;tabs.forEach(item=>{{const active=item===tab;item.classList.toggle('active',active);item.setAttribute('aria-selected',String(active))}});let visible=0;cards.forEach(card=>{{card.hidden=filter!=='all'&&card.dataset.category!==filter;if(!card.hidden)visible++}});if(visibleCount)visibleCount.textContent=String(visible);window.scrollTo({{top:0,behavior:'smooth'}})}}));</script></body></html>"#,
         owner = html_escape(&owner_uin),
-        count = items.len()
+        count = items.len(),
+        category_tabs = category_tabs
     ))
+}
+
+fn ensure_offline_resource_manifest(
+    connection: &Connection,
+    owner_uin: &str,
+    entries: &[OfflineResourceManifestEntry],
+) -> Result<(), String> {
+    for entry in entries {
+        connection
+            .execute(
+                "INSERT INTO archive_resource_cache
+                 (owner_uin,resource_key,resource_type,source_url,status,updated_at)
+                 VALUES (?1,?2,?3,?4,'pending',?5)
+                 ON CONFLICT(owner_uin,resource_key) DO UPDATE SET
+                   resource_type=excluded.resource_type,
+                   source_url=excluded.source_url,
+                   status=CASE
+                     WHEN archive_resource_cache.status='failed'
+                       AND archive_resource_cache.source_url<>excluded.source_url THEN 'pending'
+                     ELSE archive_resource_cache.status
+                   END,
+                   error=CASE
+                     WHEN archive_resource_cache.status='failed'
+                       AND archive_resource_cache.source_url<>excluded.source_url THEN NULL
+                     ELSE archive_resource_cache.error
+                   END,
+                   updated_at=excluded.updated_at",
+                params![
+                    owner_uin,
+                    entry.resource_key,
+                    entry.resource_type,
+                    entry.source_url,
+                    now()
+                ],
+            )
+            .map_err(|error| format!("登记离线资源清单失败：{error}"))?;
+    }
+    Ok(())
+}
+
+fn cached_resource_is_valid(resource_type: &str, path: &Path) -> bool {
+    let Ok(metadata) = path.symlink_metadata() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    match resource_type {
+        "avatar" | "image" | "emoji" => {
+            if metadata.len() <= 32 {
+                return false;
+            }
+            let Ok(mut file) = File::open(path) else {
+                return false;
+            };
+            let mut header = [0_u8; 16];
+            let Ok(read) = file.read(&mut header) else {
+                return false;
+            };
+            archived_image_extension(&header[..read]).is_some()
+                && !is_qq_missing_image_placeholder_with_len(&header[..read], metadata.len())
+        }
+        "video" => metadata.len() > 1024,
+        _ => false,
+    }
+}
+
+fn load_valid_offline_resources(
+    app: &tauri::AppHandle,
+    owner_uin: &str,
+    manifest: &[OfflineResourceManifestEntry],
+) -> Result<HashMap<String, PathBuf>, String> {
+    let connection = open_database(app)?;
+    let requested = manifest
+        .iter()
+        .map(|entry| entry.resource_key.as_str())
+        .collect::<HashSet<_>>();
+    let mut statement = connection
+        .prepare(
+            "SELECT resource_key,resource_type,local_path FROM archive_resource_cache
+             WHERE owner_uin=?1 AND status='cached' AND local_path IS NOT NULL",
+        )
+        .map_err(|error| format!("准备离线资源缓存查询失败：{error}"))?;
+    let rows = statement
+        .query_map(params![owner_uin], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| format!("查询离线资源缓存失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("读取离线资源缓存失败：{error}"))?;
+    drop(statement);
+    let mut valid = HashMap::new();
+    for (resource_key, resource_type, local_path) in rows {
+        if !requested.contains(resource_key.as_str()) {
+            continue;
+        }
+        let path = PathBuf::from(local_path);
+        if cached_resource_is_valid(&resource_type, &path) {
+            valid.insert(resource_key, path);
+            continue;
+        }
+        connection
+            .execute(
+                "UPDATE archive_resource_cache SET status='pending',local_path=NULL,
+             mime_type=NULL,file_size=NULL,error='本地缓存不存在或已损坏',updated_at=?3
+             WHERE owner_uin=?1 AND resource_key=?2",
+                params![owner_uin, resource_key, now()],
+            )
+            .map_err(|error| format!("重置失效离线缓存失败：{error}"))?;
+    }
+    Ok(valid)
+}
+
+fn cached_resource_mime_type(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "avif" => "image/avif",
+        "bmp" => "image/bmp",
+        "mp4" => "video/mp4",
+        _ => "application/octet-stream",
+    }
+}
+
+fn mark_offline_resource_cached(
+    app: &tauri::AppHandle,
+    owner_uin: &str,
+    resource_key: &str,
+    path: &Path,
+) -> Result<(), String> {
+    if !path.metadata().is_ok_and(|metadata| metadata.is_file()) {
+        return Err("离线资源缓存文件不存在".into());
+    }
+    let file_size = path.metadata().map(|value| value.len()).unwrap_or(0);
+    let connection = open_database(app)?;
+    connection
+        .execute(
+            "UPDATE archive_resource_cache SET status='cached',local_path=?3,mime_type=?4,
+             file_size=?5,error=NULL,updated_at=?6 WHERE owner_uin=?1 AND resource_key=?2",
+            params![
+                owner_uin,
+                resource_key,
+                path.to_string_lossy(),
+                cached_resource_mime_type(path),
+                file_size,
+                now()
+            ],
+        )
+        .map_err(|error| format!("保存离线资源缓存状态失败：{error}"))?;
+    Ok(())
+}
+
+fn mark_offline_resource_failed(
+    app: &tauri::AppHandle,
+    owner_uin: &str,
+    resource_key: &str,
+    error: &str,
+) -> Result<(), String> {
+    let connection = open_database(app)?;
+    connection
+        .execute(
+            "UPDATE archive_resource_cache SET status='failed',local_path=NULL,mime_type=NULL,
+             file_size=NULL,error=?3,attempt_count=attempt_count+1,updated_at=?4
+             WHERE owner_uin=?1 AND resource_key=?2",
+            params![owner_uin, resource_key, concise_archive_error(error), now()],
+        )
+        .map_err(|reason| format!("保存离线资源失败状态失败：{reason}"))?;
+    Ok(())
+}
+
+fn offline_avatar_placeholder() -> Vec<u8> {
+    br##"<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 96 96"><rect width="96" height="96" rx="48" fill="#e8edf4"/><circle cx="48" cy="37" r="17" fill="#aab5c4"/><path d="M19 85c3-19 14-29 29-29s26 10 29 29" fill="#aab5c4"/></svg>"##.to_vec()
+}
+
+fn offline_media_placeholder() -> Vec<u8> {
+    r##"<svg xmlns="http://www.w3.org/2000/svg" width="800" height="480" viewBox="0 0 800 480"><rect width="800" height="480" fill="#edf1f6"/><path d="M260 335l95-105 70 72 52-55 76 88z" fill="#b4bfcd"/><circle cx="321" cy="174" r="29" fill="#b4bfcd"/><text x="400" y="395" text-anchor="middle" fill="#758298" font-family="sans-serif" font-size="22">该资源未能保存到离线包</text></svg>"##.as_bytes().to_vec()
+}
+
+fn offline_emoji_placeholder() -> Vec<u8> {
+    br##"<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48"><circle cx="24" cy="24" r="22" fill="#edf1f6"/><circle cx="17" cy="20" r="2.5" fill="#758298"/><circle cx="31" cy="20" r="2.5" fill="#758298"/><path d="M15 30c5 5 13 5 18 0" fill="none" stroke="#758298" stroke-width="2.5" stroke-linecap="round"/></svg>"##.to_vec()
+}
+
+fn offline_video_placeholder() -> Vec<u8> {
+    r##"<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>视频不可用</title><style>body{display:grid;min-height:100vh;margin:0;place-items:center;background:#f3f6fb;color:#758298;font:16px system-ui,-apple-system,"Microsoft YaHei",sans-serif}</style></head><body><p>该视频未能保存到离线包，详情请查看 failed-resources.json。</p></body></html>"##.as_bytes().to_vec()
+}
+
+async fn download_offline_avatar(
+    client: &reqwest::Client,
+    user_agent: &str,
+    cookie_header: &str,
+    uin: &str,
+) -> Result<(Vec<u8>, &'static str), String> {
+    let urls = [
+        format!("https://qlogo2.store.qq.com/qzone/{uin}/{uin}/100"),
+        format!("https://q1.qlogo.cn/g?b=qq&nk={uin}&s=100"),
+    ];
+    let mut last_error = String::new();
+    let mut retry_budget = ArchiveResourceRetryBudget::default();
+    for url in urls {
+        match download_archive_resource(
+            client,
+            &url,
+            user_agent,
+            (!cookie_header.is_empty()).then_some(cookie_header),
+            true,
+            "image/avif,image/webp,image/png,image/jpeg,image/*,*/*;q=0.8",
+            "头像",
+            5 * 1024 * 1024,
+            &mut retry_budget,
+        )
+        .await
+        {
+            Ok(download) => {
+                let Some(extension) = archived_image_extension(&download.bytes) else {
+                    last_error = "QQ 返回了非图片内容".into();
+                    continue;
+                };
+                if is_qq_missing_image_placeholder(&download.bytes) {
+                    last_error = "QQ 返回了图片不存在占位图".into();
+                    continue;
+                }
+                return Ok((download.bytes, extension));
+            }
+            Err(error) => last_error = error.message,
+        }
+    }
+    Err(last_error)
+}
+
+async fn download_offline_emoji(
+    client: &reqwest::Client,
+    user_agent: &str,
+    code: &str,
+) -> Result<(Vec<u8>, &'static str), String> {
+    let mut retry_budget = ArchiveResourceRetryBudget::default();
+    let mut last_error = String::new();
+    for extension in ["gif", "png"] {
+        let url = qzone_emoji_url(code, extension);
+        match download_archive_resource(
+            client,
+            &url,
+            user_agent,
+            None,
+            true,
+            "image/gif,image/png,image/*,*/*;q=0.8",
+            "QQ 表情",
+            2 * 1024 * 1024,
+            &mut retry_budget,
+        )
+        .await
+        {
+            Ok(download) => {
+                let Some(actual_extension) = archived_image_extension(&download.bytes) else {
+                    last_error = "QQ 返回了非图片表情内容".into();
+                    continue;
+                };
+                if is_qq_missing_image_placeholder(&download.bytes) {
+                    last_error = "QQ 返回了表情不存在占位图".into();
+                    continue;
+                }
+                return Ok((download.bytes, actual_extension));
+            }
+            Err(error) => {
+                last_error = error.message;
+                if retry_budget.attempts >= ARCHIVE_RESOURCE_ATTEMPTS {
+                    break;
+                }
+            }
+        }
+    }
+    Err(if last_error.is_empty() {
+        format!("QQ 表情已达到最多 {ARCHIVE_RESOURCE_ATTEMPTS} 次尝试")
+    } else {
+        last_error
+    })
+}
+
+fn persist_offline_emoji(
+    app: &tauri::AppHandle,
+    owner_uin: &str,
+    code: &str,
+    extension: &str,
+    bytes: &[u8],
+) -> Result<PathBuf, String> {
+    let directory = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("无法获取表情缓存目录：{error}"))?
+        .join("emojis")
+        .join(owner_uin);
+    fs::create_dir_all(&directory).map_err(|error| format!("无法创建表情缓存目录：{error}"))?;
+    let path = directory.join(format!("{code}.{extension}"));
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = directory.join(format!("{code}-{nonce}.part"));
+    fs::write(&temporary, bytes).map_err(|error| format!("写入表情缓存失败：{error}"))?;
+    if path.exists() {
+        fs::remove_file(&path).map_err(|error| {
+            let _ = fs::remove_file(&temporary);
+            format!("替换失效表情缓存失败：{error}")
+        })?;
+    }
+    if let Err(error) = fs::rename(&temporary, &path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!("保存表情缓存失败：{error}"));
+    }
+    Ok(path)
+}
+
+fn persist_offline_avatar(
+    app: &tauri::AppHandle,
+    owner_uin: &str,
+    uin: &str,
+    extension: &str,
+    bytes: &[u8],
+) -> Result<PathBuf, String> {
+    let directory = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("无法获取头像缓存目录：{error}"))?
+        .join("avatars")
+        .join(owner_uin);
+    fs::create_dir_all(&directory).map_err(|error| format!("无法创建头像缓存目录：{error}"))?;
+    let safe_uin = uin
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect::<String>();
+    let file_stem = if safe_uin.is_empty() {
+        "unknown"
+    } else {
+        &safe_uin
+    };
+    let path = directory.join(format!("{file_stem}.{extension}"));
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = directory.join(format!("{file_stem}-{nonce}.part"));
+    fs::write(&temporary, bytes).map_err(|error| format!("写入头像缓存失败：{error}"))?;
+    if path.exists() {
+        fs::remove_file(&path).map_err(|error| {
+            let _ = fs::remove_file(&temporary);
+            format!("替换失效头像缓存失败：{error}")
+        })?;
+    }
+    if let Err(error) = fs::rename(&temporary, &path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!("保存头像缓存失败：{error}"));
+    }
+    Ok(path)
+}
+
+fn write_offline_zip(
+    temporary_path: &Path,
+    html: String,
+    failures: Vec<OfflineExportFailure>,
+    assets: Vec<OfflineExportAsset>,
+) -> Result<(), String> {
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(temporary_path)
+        .map_err(|error| format!("创建离线 ZIP 临时文件失败：{error}"))?;
+    let mut zip = ZipWriter::new(file);
+    let options = SimpleFileOptions::default()
+        .compression_method(CompressionMethod::Deflated)
+        .unix_permissions(0o644);
+    zip.start_file("index.html", options)
+        .map_err(|error| format!("创建离线 HTML 条目失败：{error}"))?;
+    zip.write_all(html.as_bytes())
+        .map_err(|error| format!("写入离线 HTML 失败：{error}"))?;
+    zip.start_file("failed-resources.json", options)
+        .map_err(|error| format!("创建失败清单条目失败：{error}"))?;
+    let failure_json = serde_json::to_vec_pretty(&failures)
+        .map_err(|error| format!("生成资源失败清单失败：{error}"))?;
+    zip.write_all(&failure_json)
+        .map_err(|error| format!("写入资源失败清单失败：{error}"))?;
+    let asset_options = SimpleFileOptions::default()
+        .compression_method(CompressionMethod::Stored)
+        .unix_permissions(0o644);
+    for asset in assets {
+        match asset {
+            OfflineExportAsset::Bytes { zip_path, bytes } => {
+                zip.start_file(zip_path, asset_options)
+                    .map_err(|error| format!("创建离线资源条目失败：{error}"))?;
+                zip.write_all(&bytes)
+                    .map_err(|error| format!("写入离线资源失败：{error}"))?;
+            }
+            OfflineExportAsset::File {
+                zip_path,
+                source_path,
+            } => {
+                zip.start_file(zip_path, asset_options)
+                    .map_err(|error| format!("创建离线媒体条目失败：{error}"))?;
+                let mut source = File::open(&source_path)
+                    .map_err(|error| format!("读取本地媒体缓存失败：{error}"))?;
+                let mut buffer = [0_u8; 64 * 1024];
+                loop {
+                    let read = source
+                        .read(&mut buffer)
+                        .map_err(|error| format!("读取本地媒体数据失败：{error}"))?;
+                    if read == 0 {
+                        break;
+                    }
+                    zip.write_all(&buffer[..read])
+                        .map_err(|error| format!("写入离线媒体失败：{error}"))?;
+                }
+            }
+        }
+    }
+    let file = zip
+        .finish()
+        .map_err(|error| format!("完成离线 ZIP 失败：{error}"))?;
+    file.sync_all()
+        .map_err(|error| format!("同步离线 ZIP 失败：{error}"))
+}
+
+fn replace_offline_reference(html: &mut String, remote_url: &str, local_path: &str) {
+    *html = html.replace(&html_escape(remote_url), local_path);
+}
+
+fn install_offline_zip(temporary: &Path, output: &Path, backup: &Path) -> Result<(), String> {
+    if !output.exists() {
+        return fs::rename(temporary, output).map_err(|error| {
+            let _ = fs::remove_file(temporary);
+            format!("保存离线 ZIP 失败：{error}")
+        });
+    }
+    if backup.exists() {
+        let _ = fs::remove_file(temporary);
+        return Err("离线 ZIP 备份路径已被占用，请重新导出".into());
+    }
+    fs::rename(output, backup).map_err(|error| {
+        let _ = fs::remove_file(temporary);
+        format!("无法备份已有导出文件：{error}")
+    })?;
+    if let Err(error) = fs::rename(temporary, output) {
+        let restore_result = fs::rename(backup, output);
+        let _ = fs::remove_file(temporary);
+        return match restore_result {
+            Ok(()) => Err(format!("保存离线 ZIP 失败，已恢复原文件：{error}")),
+            Err(restore_error) => Err(format!(
+                "保存离线 ZIP 失败，且原文件恢复失败：{error}；备份仍保留在 {}：{restore_error}",
+                backup.display()
+            )),
+        };
+    }
+    fs::remove_file(backup).map_err(|error| {
+        format!(
+            "离线 ZIP 已保存，但无法清理旧文件备份 {}：{error}",
+            backup.display()
+        )
+    })
+}
+
+#[tauri::command]
+pub async fn export_archived_zip(
+    app: tauri::AppHandle,
+    login: tauri::State<'_, QLoginState>,
+    state: tauri::State<'_, ArchiveState>,
+    category: String,
+    ids: Option<Vec<i64>>,
+    output_path: String,
+) -> Result<OfflineExportResult, String> {
+    validate_category(&category)?;
+    let requested_output = PathBuf::from(output_path);
+    if !requested_output.is_absolute()
+        || requested_output
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_none_or(|value| !value.eq_ignore_ascii_case("zip"))
+    {
+        return Err("请选择有效的绝对 ZIP 文件路径".into());
+    }
+    let file_name = requested_output.file_name().ok_or("导出文件名无效")?;
+    let parent = requested_output.parent().ok_or("导出目录无效")?;
+    let canonical_parent =
+        fs::canonicalize(parent).map_err(|error| format!("无法解析导出目录：{error}"))?;
+    let output = canonical_parent.join(file_name);
+    if output
+        .symlink_metadata()
+        .is_ok_and(|metadata| metadata.file_type().is_symlink() || !metadata.is_file())
+    {
+        return Err("导出目标必须是普通 ZIP 文件，不能是目录或符号链接".into());
+    }
+
+    let mut html =
+        export_archived_html(app.clone(), login.clone(), category.clone(), ids.clone()).await?;
+    let auth = login.qzone_auth().await?;
+    let selected = ids.map(|values| values.into_iter().collect::<HashSet<_>>());
+    let items = {
+        let connection = open_database(&app)?;
+        archive_items_for_export(&connection, &auth.uin, &category, selected.as_ref())?
+    };
+    let emoji_codes = archive_emoji_codes(&items);
+    let mut manifest = Vec::new();
+    let mut manifest_keys = HashSet::new();
+    for code in &emoji_codes {
+        let resource_key = format!("emoji:{code}");
+        manifest_keys.insert(resource_key.clone());
+        manifest.push(OfflineResourceManifestEntry {
+            resource_key,
+            resource_type: "emoji",
+            source_url: qzone_emoji_url(code, "gif"),
+        });
+    }
+    for item in &items {
+        if let Some(uin) = item.author_uin.as_deref() {
+            let resource_key = format!("avatar:{uin}");
+            if manifest_keys.insert(resource_key.clone()) {
+                manifest.push(OfflineResourceManifestEntry {
+                    resource_key,
+                    resource_type: "avatar",
+                    source_url: format!("https://qlogo2.store.qq.com/qzone/{uin}/{uin}/50"),
+                });
+            }
+        }
+        for (picture_index, source_url) in item.picture_urls.iter().enumerate() {
+            let resource_key = format!("image:{}:{picture_index}", item.id);
+            manifest_keys.insert(resource_key.clone());
+            manifest.push(OfflineResourceManifestEntry {
+                resource_key,
+                resource_type: "image",
+                source_url: source_url.clone(),
+            });
+        }
+        if let Some(source_url) = item.video_url.as_deref() {
+            let resource_key = format!("video:{}", item.id);
+            manifest_keys.insert(resource_key.clone());
+            manifest.push(OfflineResourceManifestEntry {
+                resource_key,
+                resource_type: "video",
+                source_url: source_url.to_owned(),
+            });
+        }
+    }
+    {
+        let connection = open_database(&app)?;
+        ensure_offline_resource_manifest(&connection, &auth.uin, &manifest)?;
+    }
+    let cached_resources = load_valid_offline_resources(&app, &auth.uin, &manifest)?;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .connect_timeout(std::time::Duration::from_secs(20))
+        .timeout(std::time::Duration::from_secs(180))
+        .build()
+        .map_err(|error| format!("创建离线资源请求客户端失败：{error}"))?;
+    let mut assets = vec![
+        OfflineExportAsset::Bytes {
+            zip_path: "assets/placeholders/avatar.svg".into(),
+            bytes: offline_avatar_placeholder(),
+        },
+        OfflineExportAsset::Bytes {
+            zip_path: "assets/placeholders/media.svg".into(),
+            bytes: offline_media_placeholder(),
+        },
+        OfflineExportAsset::Bytes {
+            zip_path: "assets/placeholders/video.html".into(),
+            bytes: offline_video_placeholder(),
+        },
+        OfflineExportAsset::Bytes {
+            zip_path: "assets/placeholders/emoji.svg".into(),
+            bytes: offline_emoji_placeholder(),
+        },
+    ];
+    let mut failures = Vec::new();
+    let mut localized_urls = HashMap::<String, LocalizedOfflineResource>::new();
+    let mut seen_avatars = HashSet::new();
+    let resource_count = manifest.len();
+
+    replace_offline_reference(
+        &mut html,
+        "https://qlogo2.store.qq.com/qzone/0/0/50",
+        "assets/placeholders/avatar.svg",
+    );
+    for code in &emoji_codes {
+        let resource_key = format!("emoji:{code}");
+        let remote_url = qzone_emoji_url(code, "gif");
+        match cached_resources.get(&resource_key).cloned() {
+            Some(source_path) => {
+                let extension = source_path
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("bin");
+                let zip_path = format!("assets/emojis/{code}.{extension}");
+                replace_offline_reference(&mut html, &remote_url, &zip_path);
+                assets.push(OfflineExportAsset::File {
+                    zip_path,
+                    source_path,
+                });
+            }
+            None => match download_offline_emoji(&client, &auth.user_agent, code).await {
+                Ok((bytes, extension)) => {
+                    let source_path =
+                        persist_offline_emoji(&app, &auth.uin, code, extension, &bytes)?;
+                    mark_offline_resource_cached(&app, &auth.uin, &resource_key, &source_path)?;
+                    let zip_path = format!("assets/emojis/{code}.{extension}");
+                    replace_offline_reference(&mut html, &remote_url, &zip_path);
+                    assets.push(OfflineExportAsset::File {
+                        zip_path,
+                        source_path,
+                    });
+                }
+                Err(error) => {
+                    mark_offline_resource_failed(&app, &auth.uin, &resource_key, &error)?;
+                    replace_offline_reference(
+                        &mut html,
+                        &remote_url,
+                        "assets/placeholders/emoji.svg",
+                    );
+                    failures.push(OfflineExportFailure {
+                        resource_type: "emoji",
+                        dynamic_id: None,
+                        source_url: remote_url,
+                        error,
+                    });
+                }
+            },
+        }
+    }
+    for item in &items {
+        if let Some(uin) = item.author_uin.as_deref() {
+            if seen_avatars.insert(uin.to_owned()) {
+                let resource_key = format!("avatar:{uin}");
+                let remote_url = format!("https://qlogo2.store.qq.com/qzone/{uin}/{uin}/50");
+                match cached_resources.get(&resource_key).cloned() {
+                    Some(source_path) => {
+                        let file_name = source_path
+                            .file_name()
+                            .and_then(|value| value.to_str())
+                            .unwrap_or("unknown.bin");
+                        let zip_path = format!("assets/avatars/{file_name}");
+                        replace_offline_reference(&mut html, &remote_url, &zip_path);
+                        assets.push(OfflineExportAsset::File {
+                            zip_path,
+                            source_path,
+                        });
+                    }
+                    None => match download_offline_avatar(
+                        &client,
+                        &auth.user_agent,
+                        &auth.cookie_header,
+                        uin,
+                    )
+                    .await
+                    {
+                        Ok((bytes, extension)) => {
+                            let source_path =
+                                persist_offline_avatar(&app, &auth.uin, uin, extension, &bytes)?;
+                            mark_offline_resource_cached(
+                                &app,
+                                &auth.uin,
+                                &resource_key,
+                                &source_path,
+                            )?;
+                            let file_name = source_path
+                                .file_name()
+                                .and_then(|value| value.to_str())
+                                .unwrap_or("unknown.bin");
+                            let zip_path = format!("assets/avatars/{file_name}");
+                            replace_offline_reference(&mut html, &remote_url, &zip_path);
+                            assets.push(OfflineExportAsset::File {
+                                zip_path,
+                                source_path,
+                            });
+                        }
+                        Err(error) => {
+                            mark_offline_resource_failed(&app, &auth.uin, &resource_key, &error)?;
+                            replace_offline_reference(
+                                &mut html,
+                                &remote_url,
+                                "assets/placeholders/avatar.svg",
+                            );
+                            failures.push(OfflineExportFailure {
+                                resource_type: "avatar",
+                                dynamic_id: Some(item.id),
+                                source_url: remote_url,
+                                error,
+                            });
+                        }
+                    },
+                }
+            }
+        }
+        for (picture_index, remote_url) in item.picture_urls.iter().enumerate() {
+            let resource_key = format!("image:{}:{picture_index}", item.id);
+            if let Some(localized) = localized_urls.get(remote_url) {
+                match localized {
+                    LocalizedOfflineResource::Cached {
+                        zip_path,
+                        source_path,
+                    } => {
+                        replace_offline_reference(&mut html, remote_url, zip_path);
+                        mark_offline_resource_cached(&app, &auth.uin, &resource_key, source_path)?;
+                    }
+                    LocalizedOfflineResource::Failed { placeholder, error } => {
+                        replace_offline_reference(&mut html, remote_url, placeholder);
+                        mark_offline_resource_failed(&app, &auth.uin, &resource_key, error)?;
+                        failures.push(OfflineExportFailure {
+                            resource_type: "image",
+                            dynamic_id: Some(item.id),
+                            source_url: remote_url.clone(),
+                            error: error.clone(),
+                        });
+                    }
+                }
+                continue;
+            }
+            if let Some(source_path) = cached_resources.get(&resource_key).cloned() {
+                let extension = source_path
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("bin");
+                let zip_path = format!("assets/images/{}-{}.{}", item.id, picture_index, extension);
+                replace_offline_reference(&mut html, remote_url, &zip_path);
+                localized_urls.insert(
+                    remote_url.clone(),
+                    LocalizedOfflineResource::Cached {
+                        zip_path: zip_path.clone(),
+                        source_path: source_path.clone(),
+                    },
+                );
+                assets.push(OfflineExportAsset::File {
+                    zip_path,
+                    source_path,
+                });
+                continue;
+            }
+            match load_archived_image(
+                app.clone(),
+                login.clone(),
+                state.clone(),
+                item.id,
+                picture_index,
+            )
+            .await
+            {
+                Ok(source) => {
+                    let source_path = PathBuf::from(source);
+                    mark_offline_resource_cached(&app, &auth.uin, &resource_key, &source_path)?;
+                    let extension = source_path
+                        .extension()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("bin");
+                    let zip_path =
+                        format!("assets/images/{}-{}.{}", item.id, picture_index, extension);
+                    replace_offline_reference(&mut html, remote_url, &zip_path);
+                    localized_urls.insert(
+                        remote_url.clone(),
+                        LocalizedOfflineResource::Cached {
+                            zip_path: zip_path.clone(),
+                            source_path: source_path.clone(),
+                        },
+                    );
+                    assets.push(OfflineExportAsset::File {
+                        zip_path,
+                        source_path,
+                    });
+                }
+                Err(error) => {
+                    let placeholder = "assets/placeholders/media.svg".to_owned();
+                    mark_offline_resource_failed(&app, &auth.uin, &resource_key, &error)?;
+                    replace_offline_reference(&mut html, remote_url, &placeholder);
+                    localized_urls.insert(
+                        remote_url.clone(),
+                        LocalizedOfflineResource::Failed {
+                            placeholder: placeholder.clone(),
+                            error: error.clone(),
+                        },
+                    );
+                    failures.push(OfflineExportFailure {
+                        resource_type: "image",
+                        dynamic_id: Some(item.id),
+                        source_url: remote_url.clone(),
+                        error,
+                    });
+                }
+            }
+        }
+        if let Some(remote_url) = item.video_url.as_deref() {
+            let resource_key = format!("video:{}", item.id);
+            if let Some(localized) = localized_urls.get(remote_url) {
+                match localized {
+                    LocalizedOfflineResource::Cached {
+                        zip_path,
+                        source_path,
+                    } => {
+                        replace_offline_reference(&mut html, remote_url, zip_path);
+                        mark_offline_resource_cached(&app, &auth.uin, &resource_key, source_path)?;
+                    }
+                    LocalizedOfflineResource::Failed { placeholder, error } => {
+                        replace_offline_reference(&mut html, remote_url, placeholder);
+                        mark_offline_resource_failed(&app, &auth.uin, &resource_key, error)?;
+                        failures.push(OfflineExportFailure {
+                            resource_type: "video",
+                            dynamic_id: Some(item.id),
+                            source_url: remote_url.to_owned(),
+                            error: error.clone(),
+                        });
+                    }
+                }
+                continue;
+            }
+            if let Some(source_path) = cached_resources.get(&resource_key).cloned() {
+                let zip_path = format!("assets/videos/{}.mp4", item.id);
+                replace_offline_reference(&mut html, remote_url, &zip_path);
+                localized_urls.insert(
+                    remote_url.to_owned(),
+                    LocalizedOfflineResource::Cached {
+                        zip_path: zip_path.clone(),
+                        source_path: source_path.clone(),
+                    },
+                );
+                assets.push(OfflineExportAsset::File {
+                    zip_path,
+                    source_path,
+                });
+                continue;
+            }
+            match load_archived_video(app.clone(), login.clone(), item.id).await {
+                Ok(source) => {
+                    let source_path = PathBuf::from(source);
+                    mark_offline_resource_cached(&app, &auth.uin, &resource_key, &source_path)?;
+                    let zip_path = format!("assets/videos/{}.mp4", item.id);
+                    replace_offline_reference(&mut html, remote_url, &zip_path);
+                    localized_urls.insert(
+                        remote_url.to_owned(),
+                        LocalizedOfflineResource::Cached {
+                            zip_path: zip_path.clone(),
+                            source_path: source_path.clone(),
+                        },
+                    );
+                    assets.push(OfflineExportAsset::File {
+                        zip_path,
+                        source_path,
+                    });
+                }
+                Err(error) => {
+                    let placeholder = "assets/placeholders/video.html".to_owned();
+                    mark_offline_resource_failed(&app, &auth.uin, &resource_key, &error)?;
+                    replace_offline_reference(&mut html, remote_url, &placeholder);
+                    localized_urls.insert(
+                        remote_url.to_owned(),
+                        LocalizedOfflineResource::Failed {
+                            placeholder: placeholder.clone(),
+                            error: error.clone(),
+                        },
+                    );
+                    failures.push(OfflineExportFailure {
+                        resource_type: "video",
+                        dynamic_id: Some(item.id),
+                        source_url: remote_url.to_owned(),
+                        error,
+                    });
+                }
+            }
+        }
+    }
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = canonical_parent.join(format!(".qzonearchive-export-{nonce}.part"));
+    let failure_count = failures.len();
+    let build_path = temporary.clone();
+    let build_result = tauri::async_runtime::spawn_blocking(move || {
+        write_offline_zip(&build_path, html, failures, assets)
+    })
+    .await
+    .map_err(|error| format!("离线 ZIP 写入任务异常退出：{error}"))?;
+    if let Err(error) = build_result {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    let backup = canonical_parent.join(format!(".qzonearchive-export-{nonce}.backup"));
+    install_offline_zip(&temporary, &output, &backup)?;
+    Ok(OfflineExportResult {
+        records: items.len(),
+        resources: resource_count,
+        failed: failure_count,
+    })
 }
 
 #[tauri::command]
@@ -2648,15 +3837,16 @@ pub async fn count_archived_feeds(
     validate_category(&category)?;
     let owner_uin = login.qzone_auth().await?.uin;
     tauri::async_runtime::spawn_blocking(move || {
-    let connection = open_database(&app)?;
-    connection
-        .query_row(
-            "SELECT COUNT(*) FROM archive_dynamics WHERE owner_uin=?1 AND category=?2",
-            params![owner_uin, category],
-            |row| row.get::<_, i64>(0),
-        )
-        .map(|count| count.max(0) as u64)
-        .map_err(|error| format!("统计归档数量失败：{error}"))
+        let connection = open_database(&app)?;
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM archive_dynamics
+                 WHERE owner_uin=?1 AND (?2='all' OR category=?2)",
+                params![owner_uin, category],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count.max(0) as u64)
+            .map_err(|error| format!("统计归档数量失败：{error}"))
     })
     .await
     .map_err(|error| format!("归档统计任务异常退出：{error}"))?
@@ -2857,6 +4047,22 @@ pub async fn delete_all_app_data(
     if images.exists() {
         fs::remove_dir_all(images).map_err(|error| format!("删除图片归档失败：{error}"))?;
     }
+    let avatars = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("无法获取头像缓存目录：{error}"))?
+        .join("avatars");
+    if avatars.exists() {
+        fs::remove_dir_all(avatars).map_err(|error| format!("删除头像缓存失败：{error}"))?;
+    }
+    let emojis = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("无法获取表情缓存目录：{error}"))?
+        .join("emojis");
+    if emojis.exists() {
+        fs::remove_dir_all(emojis).map_err(|error| format!("删除表情缓存失败：{error}"))?;
+    }
     if let Ok(mut progress) = state.progress.lock() {
         *progress = ArchiveProgress::default();
     }
@@ -2903,11 +4109,16 @@ pub async fn list_interactors(
 #[cfg(test)]
 mod tests {
     use super::{
-        advance_feed_cursor, archive_page_delay_ms, checkpoint_is_stale, comment_from_values,
-        merge_comments, parse_feed, parse_feed_cursor, serialize_query_pairs, skip_probe_offsets,
-        ArchiveCheckpoint, FeedCursorDetails,
+        advance_feed_cursor, archive_page_delay_ms, archive_resource_retry_delay,
+        archive_resource_status_is_retryable, cached_resource_is_valid, checkpoint_is_stale,
+        comment_from_values, content_looks_truncated, dynamic_content_from_original,
+        install_offline_zip, merge_comments, parse_feed, parse_feed_cursor, qzone_emoji_codes,
+        qzone_text_html, replace_offline_reference, save_original_dynamic, serialize_query_pairs,
+        skip_probe_offsets, write_offline_zip, ArchiveCheckpoint, FeedCursorDetails,
+        OfflineExportAsset, ARCHIVE_RESOURCE_ATTEMPTS,
     };
     use serde_json::json;
+    use std::io::Read;
 
     #[test]
     fn parses_like_event_sample_shape() {
@@ -2931,6 +4142,88 @@ mod tests {
         assert_eq!(parsed.event_type, 2);
         assert_eq!(parsed.picture_count, 2);
         assert!(parsed.comments_json.is_some());
+    }
+
+    #[test]
+    fn prefers_complete_dynamic_content_over_truncated_summary() {
+        let original = json!({
+            "content": "这是一条完整的动态正文",
+            "cell_summary": {"summary": "这是一条完整..."}
+        });
+
+        assert_eq!(
+            dynamic_content_from_original(&original).as_deref(),
+            Some("这是一条完整的动态正文")
+        );
+        assert!(content_looks_truncated("内容..."));
+        assert!(content_looks_truncated("内容……最后一个字符仍是…"));
+        assert!(!content_looks_truncated("完整内容。"));
+    }
+
+    #[test]
+    fn does_not_overwrite_complete_content_with_a_shorter_summary() {
+        let mut connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE archive_dynamics (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    owner_uin TEXT NOT NULL,
+                    cell_id TEXT NOT NULL,
+                    published_at INTEGER NOT NULL DEFAULT 0,
+                    content TEXT,
+                    author_uin TEXT,
+                    author_name TEXT,
+                    category TEXT NOT NULL DEFAULT '',
+                    pictures_json TEXT,
+                    video_json TEXT,
+                    raw_original_json TEXT NOT NULL,
+                    archived_at INTEGER NOT NULL,
+                    UNIQUE(owner_uin, cell_id)
+                );",
+            )
+            .unwrap();
+        let complete = json!({
+            "original": {
+                "cell_id": {"cellid": "mood-1"},
+                "cell_comm": {"appid": 311, "time": 1},
+                "content": "这是一条不会被摘要覆盖的完整正文",
+                "cell_summary": {"summary": "这是一条不会..."},
+                "cell_userinfo": {"user": {"uin": "1", "nickname": "用户"}}
+            }
+        });
+        let truncated = json!({
+            "original": {
+                "cell_id": {"cellid": "mood-1"},
+                "cell_comm": {"appid": 311, "time": 1},
+                "cell_summary": {"summary": "这是一条不会..."},
+                "cell_userinfo": {"user": {"uin": "1", "nickname": "用户"}}
+            }
+        });
+        let transaction = connection.transaction().unwrap();
+        save_original_dynamic(&transaction, "1", &complete).unwrap();
+        save_original_dynamic(&transaction, "1", &truncated).unwrap();
+        transaction.commit().unwrap();
+
+        let content: String = connection
+            .query_row(
+                "SELECT content FROM archive_dynamics WHERE cell_id='mood-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(content, "这是一条不会被摘要覆盖的完整正文");
+    }
+
+    #[test]
+    fn renders_qzone_emoji_tokens_as_images() {
+        let value = "你好[em]e176[/em]@{uin:123,nick:好友,who:1}";
+        let html = qzone_text_html(Some(value));
+
+        assert_eq!(qzone_emoji_codes(value), vec!["e176"]);
+        assert!(html.contains("class=\"qzone-emoji\""));
+        assert!(html.contains("https://qzonestyle.gtimg.cn/qzone/em/e176.gif"));
+        assert!(html.contains("title=\"QQ 123\">@好友</span>"));
+        assert!(!html.contains("[em]e176[/em]"));
     }
 
     #[test]
@@ -3248,5 +4541,123 @@ mod tests {
             skip_probe_offsets(20),
             vec![20, 32, 64, 128, 256, 512, 1024, 2048, 4096]
         );
+    }
+
+    #[test]
+    fn writes_offline_zip_with_html_manifest_and_assets() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "qzonearchive-offline-export-{}-{nonce}.zip",
+            std::process::id()
+        ));
+        write_offline_zip(
+            &path,
+            "<html><img src=\"assets/test.svg\"></html>".into(),
+            vec![],
+            vec![OfflineExportAsset::Bytes {
+                zip_path: "assets/test.svg".into(),
+                bytes: b"<svg/>".to_vec(),
+            }],
+        )
+        .unwrap();
+
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+        assert_eq!(archive.len(), 3);
+        let mut html = String::new();
+        archive
+            .by_name("index.html")
+            .unwrap()
+            .read_to_string(&mut html)
+            .unwrap();
+        assert!(html.contains("assets/test.svg"));
+        assert!(archive.by_name("failed-resources.json").is_ok());
+        assert!(archive.by_name("assets/test.svg").is_ok());
+        drop(archive);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn safely_replaces_existing_offline_zip() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir();
+        let output = directory.join(format!(
+            "qzonearchive-existing-export-{}-{nonce}.zip",
+            std::process::id()
+        ));
+        let temporary = directory.join(format!(
+            "qzonearchive-new-export-{}-{nonce}.part",
+            std::process::id()
+        ));
+        let backup = directory.join(format!(
+            "qzonearchive-export-backup-{}-{nonce}.backup",
+            std::process::id()
+        ));
+        std::fs::write(&output, b"old archive").unwrap();
+        std::fs::write(&temporary, b"new archive").unwrap();
+
+        install_offline_zip(&temporary, &output, &backup).unwrap();
+
+        assert_eq!(std::fs::read(&output).unwrap(), b"new archive");
+        assert!(!temporary.exists());
+        assert!(!backup.exists());
+        std::fs::remove_file(output).unwrap();
+    }
+
+    #[test]
+    fn replaces_html_escaped_remote_resource_references() {
+        let mut html = r#"<a href="https://example.com/a?x=1&amp;y=2"><img src="https://example.com/a?x=1&amp;y=2"></a>"#.to_owned();
+        replace_offline_reference(
+            &mut html,
+            "https://example.com/a?x=1&y=2",
+            "assets/images/1.jpg",
+        );
+        assert_eq!(html.matches("assets/images/1.jpg").count(), 2);
+        assert!(!html.contains("https://"));
+    }
+
+    #[test]
+    fn retries_archive_resources_with_archive_backoff_policy() {
+        assert_eq!(ARCHIVE_RESOURCE_ATTEMPTS, 5);
+        assert_eq!(archive_resource_retry_delay(1).as_millis(), 1_500);
+        assert_eq!(archive_resource_retry_delay(2).as_millis(), 3_000);
+        assert_eq!(archive_resource_retry_delay(4).as_millis(), 12_000);
+        assert!(archive_resource_status_is_retryable(
+            reqwest::StatusCode::TOO_MANY_REQUESTS
+        ));
+        assert!(archive_resource_status_is_retryable(
+            reqwest::StatusCode::BAD_GATEWAY
+        ));
+        assert!(!archive_resource_status_is_retryable(
+            reqwest::StatusCode::FORBIDDEN
+        ));
+        assert!(!archive_resource_status_is_retryable(
+            reqwest::StatusCode::NOT_FOUND
+        ));
+    }
+
+    #[test]
+    fn rejects_missing_or_invalid_local_resource_cache() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "qzonearchive-cache-check-{}-{nonce}.jpg",
+            std::process::id()
+        ));
+        assert!(!cached_resource_is_valid("image", &path));
+        let mut jpeg = vec![0xff, 0xd8, 0xff];
+        jpeg.resize(64, 0);
+        std::fs::write(&path, jpeg).unwrap();
+        assert!(cached_resource_is_valid("image", &path));
+        std::fs::write(&path, b"not an image").unwrap();
+        assert!(!cached_resource_is_valid("image", &path));
+        std::fs::remove_file(path).unwrap();
     }
 }

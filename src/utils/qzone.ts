@@ -47,6 +47,11 @@ export const listArchivedMedia = (limit = 60, offset = 0, year?: number) => invo
 export const getArchivedFeed = (id: number) => invoke<ArchiveItem>("get_archived_feed", { id });
 export const countArchivedFeeds = (category: ArchiveCategory = "self") => invoke<number>("count_archived_feeds", { category });
 export const exportArchivedHtml = (category: ArchiveCategory, ids?: number[]) => invoke<string>("export_archived_html", { category, ids });
+export interface OfflineExportResult { records: number; resources: number; failed: number; }
+export const exportArchivedZip = (category: ArchiveCategory, outputPath: string, ids?: number[]) =>
+  invoke<OfflineExportResult>("export_archived_zip", { category, ids, outputPath });
+export const exportAllArchivedZip = (outputPath: string) =>
+  invoke<OfflineExportResult>("export_archived_zip", { category: "all", outputPath });
 export const loadArchivedImage = (id: number, pictureIndex: number) => invoke<string>("load_archived_image", { id, pictureIndex });
 export const loadArchivedVideo = (id: number) => invoke<string>("load_archived_video", { id });
 export interface ArchiveOverview { dynamics: number; pictures: number; comments: number; likes: number; databaseBytes: number; }

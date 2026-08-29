@@ -12,7 +12,7 @@ import Paginator, { type PageState } from "primevue/paginator";
 import QzoneText from "../components/QzoneText.vue";
 import { loadRemoteImageBlob } from "../utils/archiveImage";
 import { useAuthStore } from "../stores/auth";
-import { clearArchivedFeeds, countArchivedFeeds, deleteArchivedFeeds, exportArchivedHtml, listArchivedFeeds, loadArchivedImage, loadArchivedVideo, type ArchiveCategory, type ArchiveItem } from "../utils/qzone";
+import { clearArchivedFeeds, countArchivedFeeds, deleteArchivedFeeds, exportArchivedZip, listArchivedFeeds, loadArchivedImage, loadArchivedVideo, type ArchiveCategory, type ArchiveItem } from "../utils/qzone";
 
 type DeleteAction = "selected" | "all";
 const authStore = useAuthStore();
@@ -22,6 +22,7 @@ const loading = ref(false);
 const deleting = ref(false);
 const exporting = ref(false);
 const error = ref("");
+const exportNotice = ref("");
 const selectedIds = ref<number[]>([]);
 const confirmVisible = ref(false);
 const pendingAction = ref<DeleteAction>("selected");
@@ -208,18 +209,18 @@ async function savePreviewImage() {
   } catch (reason) { error.value = `保存图片失败：${String(reason)}`; }
   finally { savingImage.value = false; }
 }
-async function exportHtml(selectedOnly: boolean) {
+async function exportZip(selectedOnly: boolean) {
   if (exporting.value || (selectedOnly && !selectedIds.value.length)) return;
-  exporting.value = true; error.value = "";
+  exporting.value = true; error.value = ""; exportNotice.value = "";
   try {
-    const html = await exportArchivedHtml(category.value, selectedOnly ? selectedIds.value : undefined);
     const date = new Date().toISOString().slice(0, 10);
     const path = await save({
-      defaultPath: `QQ空间归档-${categoryLabel.value}-${date}.html`,
-      filters: [{ name: "HTML 网页", extensions: ["html"] }],
+      defaultPath: `QQ空间归档-${categoryLabel.value}-${date}.zip`,
+      filters: [{ name: "ZIP 离线归档", extensions: ["zip"] }],
     });
     if (!path) return;
-    await writeFile(path, new TextEncoder().encode(html));
+    const result = await exportArchivedZip(category.value, path, selectedOnly ? selectedIds.value : undefined);
+    exportNotice.value = `离线 ZIP 导出完成：${result.records} 条归档、${result.resources} 个资源${result.failed ? `，${result.failed} 个资源失败（详见压缩包内清单）` : ""}`;
   } catch (reason) { error.value = `导出失败：${String(reason)}`; }
   finally { exporting.value = false; }
 }
@@ -267,7 +268,7 @@ onBeforeUnmount(() => { clearLongPress(); imageObserver?.disconnect(); releaseVi
     </div>
     <div class="archive-header-actions">
       <Button icon="pi pi-refresh" label="刷新" severity="secondary" text :loading="loading" @click="load" />
-      <Button icon="pi pi-file-export" label="导出全部" severity="secondary" text :loading="exporting" :disabled="!totalRecords || loading" @click="exportHtml(false)" />
+      <Button icon="pi pi-file-export" label="导出全部 ZIP" severity="secondary" text :loading="exporting" :disabled="!totalRecords || loading" @click="exportZip(false)" />
       <Button icon="pi pi-trash" label="清空归档" severity="danger" text :disabled="!totalRecords || loading" @click="askDelete('all')" />
     </div>
   </section>
@@ -286,13 +287,14 @@ onBeforeUnmount(() => { clearLongPress(); imageObserver?.disconnect(); releaseVi
       <div v-if="records.length" class="selection-controls">
         <Button :label="allVisibleSelected ? '取消全选' : '全选'" icon="pi pi-check-square" severity="secondary" outlined size="small" @click="toggleVisible" />
         <span v-if="selectedIds.length" class="selection-count">已选 {{ selectedIds.length }} 条</span>
-        <Button v-if="selectedIds.length" label="导出选中" icon="pi pi-file-export" severity="secondary" size="small" :loading="exporting" @click="exportHtml(true)" />
+        <Button v-if="selectedIds.length" label="导出选中 ZIP" icon="pi pi-file-export" severity="secondary" size="small" :loading="exporting" @click="exportZip(true)" />
         <Button v-if="selectedIds.length" label="删除所选" icon="pi pi-trash" severity="danger" size="small" @click="askDelete('selected')" />
       </div>
     </div>
   </section>
 
   <p v-if="error" class="archive-error"><i class="pi pi-exclamation-circle" />{{ error }}</p>
+  <p v-if="exportNotice" class="archive-export-notice"><i class="pi pi-check-circle" />{{ exportNotice }}</p>
   <section v-if="filtered.length" class="archive-list">
     <article v-for="item in filtered" :key="item.id" class="surface-card archive-card" :class="{ 'archive-card-selected': selectedIds.includes(item.id) }">
       <Checkbox v-model="selectedIds" class="archive-checkbox" :input-id="`archive-${item.id}`" :value="item.id" />
