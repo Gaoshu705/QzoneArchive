@@ -796,6 +796,12 @@ fn retryable_response_reason(status: reqwest::StatusCode, body: &str) -> Option<
     None
 }
 
+/// 传输层在正文结束时可能报告错误，但此前收到的字节已经构成完整响应。
+/// 仅当正文是成功且不可重试的 JSON 时继续解析，截断正文和临时错误仍走重试。
+fn response_body_usable_after_read_error(status: reqwest::StatusCode, body: &str) -> bool {
+    status.is_success() && retryable_response_reason(status, body).is_none()
+}
+
 fn feed_retry_delay(attempt: u32) -> std::time::Duration {
     std::time::Duration::from_millis(1_500 * 2_u64.pow(attempt.saturating_sub(1)))
 }
@@ -1045,6 +1051,12 @@ async fn fetch_feeds_with_attempts(
                         "响应体读取失败（第 {attempt}/{attempts} 次，已接收 {} 字节）：{reason:#}",
                         bytes.len()
                     );
+                    if response_body_usable_after_read_error(status, &body) {
+                        transport_attempts
+                            .push(format!("{detail}；已收到完整、不可重试的 JSON，继续解析"));
+                        response = Some((status, headers, body));
+                        break;
+                    }
                     transport_attempts.push(detail.clone());
                     last_error = Some(detail);
                     log_feed_request_error(
@@ -1199,7 +1211,10 @@ pub async fn fetch_more_feeds(
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_qzone_success, feed_error_can_skip, parse_feed_page, parse_qzone_json, retryable_response_reason, FEEDS_URL};
+    use super::{
+        ensure_qzone_success, feed_error_can_skip, parse_feed_page, parse_qzone_json,
+        response_body_usable_after_read_error, retryable_response_reason, FEEDS_URL,
+    };
     use reqwest::StatusCode;
     use serde_json::json;
 
@@ -1257,6 +1272,30 @@ mod tests {
             r#"{"code":-3000,"message":"登录失效，请重新登录"}"#,
         )
         .is_none());
+    }
+
+    #[test]
+    fn accepts_complete_feed_json_after_transport_read_error() {
+        assert!(response_body_usable_after_read_error(
+            StatusCode::OK,
+            r#"{"code":0,"data":{"attachinfo":"next","hasmore":1,"vFeeds":[{"id":1}]}}"#,
+        ));
+    }
+
+    #[test]
+    fn rejects_truncated_or_retryable_body_after_transport_read_error() {
+        assert!(!response_body_usable_after_read_error(
+            StatusCode::OK,
+            r#"{"code":0,"data":{"vFeeds":["#,
+        ));
+        assert!(!response_body_usable_after_read_error(
+            StatusCode::OK,
+            r#"{"code":-1,"message":"系统繁忙，请稍后再试"}"#,
+        ));
+        assert!(!response_body_usable_after_read_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            r#"{"code":0,"data":{"vFeeds":[]}}"#,
+        ));
     }
 
     #[test]
