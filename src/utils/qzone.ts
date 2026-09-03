@@ -59,8 +59,9 @@ export const deleteArchivedFeeds = (ids: number[]) => invoke<number>("delete_arc
 export const clearArchivedFeeds = () => invoke<number>("clear_archived_feeds");
 export const deleteAllAppData = () => invoke<void>("delete_all_app_data");
 
+export interface RecyclePasswordStatus { token: string | null; windowOpen: boolean; }
 export const openRecyclePasswordWindow = () => invoke<void>("open_recycle_password_window");
-export const checkRecyclePassword = () => invoke<string | null>("check_recycle_password");
+export const checkRecyclePassword = () => invoke<RecyclePasswordStatus>("check_recycle_password");
 export const closeRecyclePasswordWindow = () => invoke<void>("close_recycle_password_window");
 export const listRecycleAlbums = (pwd2sig: string) => invoke<Record<string, unknown>>("list_recycle_albums", { pwd2sig });
 export const listRecyclePhotos = (pwd2sig: string, albumId?: string) => invoke<Record<string, unknown>>("list_recycle_photos", { pwd2sig, albumId });

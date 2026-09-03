@@ -79,6 +79,12 @@ async function loadAll() {
   try { albums.value = mapAlbums(await listRecycleAlbums(token.value)); await loadPhotos(); }
   catch (reason) { error.value = String(reason); loading.value = false; }
 }
+async function cancelVerify() {
+  verifyRun += 1;
+  verifying.value = false;
+  try { await closeRecyclePasswordWindow(); }
+  catch (reason) { error.value = String(reason); }
+}
 async function verify() {
   if (!auth.loggedIn) { await auth.openLogin(); return; }
   const run = ++verifyRun; verifying.value = true; error.value = "";
@@ -86,7 +92,8 @@ async function verify() {
     await openRecyclePasswordWindow();
     while (run === verifyRun && verifying.value) {
       const result = await checkRecyclePassword();
-      if (result) { recycleSession.setVerified(result, auth.user?.uin ?? ""); verifying.value = false; await closeRecyclePasswordWindow(); await loadAll(); return; }
+      if (result.token) { recycleSession.setVerified(result.token, auth.user?.uin ?? ""); verifying.value = false; await closeRecyclePasswordWindow(); await loadAll(); return; }
+      if (!result.windowOpen) { error.value = "验证窗口已关闭，请重新点击验证"; verifying.value = false; return; }
       await delay(1200);
     }
   } catch (reason) { error.value = String(reason); verifying.value = false; }
@@ -176,8 +183,11 @@ onBeforeUnmount(() => { verifyRun += 1; verifying.value = false; void closeRecyc
     <section v-if="!verified" class="surface-card empty-state recycle-auth-state">
       <span><i class="pi pi-lock" /></span><h2>需要验证 QQ 空间独立密码</h2>
       <p>验证将在独立的内置浏览器窗口中完成。应用不会读取或保存你的密码，只接收返回的临时验证签名。</p>
-      <Button :label="verifying ? '等待验证完成…' : (auth.loggedIn ? '验证独立密码' : '先登录 QQ 空间')" icon="pi pi-shield" :loading="verifying" @click="verify" />
-      <small v-if="verifying" class="recycle-auth-tip">请在弹出窗口完成验证，成功后会自动刷新。</small><p v-if="error" class="recycle-error">{{ error }}</p>
+      <div class="recycle-auth-actions">
+        <Button :label="verifying ? '等待验证完成…' : (auth.loggedIn ? '验证独立密码' : '先登录 QQ 空间')" icon="pi pi-shield" :loading="verifying" :disabled="verifying" @click="verify" />
+        <Button v-if="verifying" label="取消" severity="secondary" text @click="cancelVerify" />
+      </div>
+      <small v-if="verifying" class="recycle-auth-tip">请在弹出的验证窗口中输入独立密码。若窗口未正常显示，请取消后重试。</small><p v-if="error" class="recycle-error">{{ error }}</p>
     </section>
     <template v-else>
       <section class="surface-card recycle-toolbar">

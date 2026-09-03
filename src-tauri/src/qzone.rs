@@ -13,6 +13,7 @@ use crate::qlogin::QLoginState;
 const FEEDS_URL: &str = "https://mobile.qzone.qq.com/get_feeds";
 const FEED_RESPONSE_ATTEMPTS: u32 = 6;
 const RECYCLE_WINDOW_LABEL: &str = "qzone-recycle-auth";
+const RECYCLE_TOKEN_BRIDGE_PATH: &str = "/__qza_pwd2sig__";
 const RECYCLE_ALBUM_LIST_URL: &str =
     "https://user.qzone.qq.com/proxy/domain/photo.qzone.qq.com/cgi-bin/common/cgi_alist_recycle_v2";
 const RECYCLE_PHOTO_LIST_URL: &str =
@@ -31,12 +32,107 @@ pub struct RecycleAuthState {
     pwd2sig: Arc<Mutex<Option<String>>>,
 }
 
-#[cfg(windows)]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecyclePasswordStatus {
+    token: Option<String>,
+    window_open: bool,
+}
+
+fn valid_pwd2sig(value: &str) -> bool {
+    (5..=4096).contains(&value.len()) && !value.chars().any(char::is_control)
+}
+
 fn pwd2sig_from_url(value: &str) -> Option<String> {
     let url = Url::parse(value).ok()?;
-    url.query_pairs().find_map(|(key, value)| {
-        key.eq_ignore_ascii_case("pwd2sig").then(|| value.into_owned())
-    })
+    let from_pairs = |pairs: url::form_urlencoded::Parse<'_>| {
+        pairs.into_iter().find_map(|(key, value)| {
+            key.eq_ignore_ascii_case("pwd2sig")
+                .then(|| value.into_owned())
+        })
+    };
+    from_pairs(url.query_pairs())
+        .or_else(|| {
+            from_pairs(url::form_urlencoded::parse(
+                url.fragment().unwrap_or_default().as_bytes(),
+            ))
+        })
+        .filter(|token| valid_pwd2sig(token))
+}
+
+fn store_pwd2sig(state: &RecycleAuthState, token: String) {
+    if !valid_pwd2sig(&token) {
+        return;
+    }
+    if let Ok(mut guard) = state.pwd2sig.lock() {
+        *guard = Some(token);
+    }
+}
+
+fn is_qzone_url(url: &Url) -> bool {
+    url.scheme() == "https"
+        && url
+            .host_str()
+            .is_some_and(|host| host == "qzone.qq.com" || host.ends_with(".qzone.qq.com"))
+}
+
+fn set_recycle_window_cookies(
+    window: &tauri::WebviewWindow,
+    cookie_header: &str,
+) -> Result<(), String> {
+    let mut cookie_count = 0;
+    for entry in cookie_header
+        .split("; ")
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        let cookie = format!("{entry}; Domain=.qq.com; Path=/; Secure")
+            .parse::<cookie::Cookie>()
+            .map_err(|_| "解析 QQ 登录 Cookie 失败".to_string())?;
+        window
+            .set_cookie(cookie)
+            .map_err(|error| format!("同步 QQ 登录状态到验证窗口失败：{error}"))?;
+        cookie_count += 1;
+    }
+    if cookie_count == 0 {
+        return Err("QQ 登录状态为空，请重新登录".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod recycle_auth_tests {
+    use super::{is_qzone_url, pwd2sig_from_url};
+    use url::Url;
+
+    #[test]
+    fn extracts_pwd2sig_from_query_or_fragment() {
+        assert_eq!(
+            pwd2sig_from_url("https://user.qzone.qq.com/callback?pwd2sig=query-token"),
+            Some("query-token".into())
+        );
+        assert_eq!(
+            pwd2sig_from_url("https://user.qzone.qq.com/callback#pwd2sig=fragment%2Btoken"),
+            Some("fragment+token".into())
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_tokens_and_non_qzone_urls() {
+        assert_eq!(
+            pwd2sig_from_url("https://user.qzone.qq.com/callback?pwd2sig=bad%0Atoken"),
+            None
+        );
+        assert!(is_qzone_url(
+            &Url::parse("https://photo.qzone.qq.com/frame").unwrap()
+        ));
+        assert!(!is_qzone_url(
+            &Url::parse("https://example.com/?pwd2sig=forged-token").unwrap()
+        ));
+        assert!(!is_qzone_url(
+            &Url::parse("http://user.qzone.qq.com/?pwd2sig=insecure-token").unwrap()
+        ));
+    }
 }
 
 #[cfg(windows)]
@@ -67,9 +163,7 @@ fn install_recycle_request_listener(window: &tauri::WebviewWindow, state: Recycl
                 let uri = take_pwstr(raw_uri);
                 if uri.contains("cgi_plist_recycle_v2") {
                     if let Some(token) = pwd2sig_from_url(&uri) {
-                        if let Ok(mut guard) = state.pwd2sig.lock() {
-                            *guard = Some(token);
-                        }
+                        store_pwd2sig(&state, token);
                     }
                 }
                 Ok(())
@@ -207,38 +301,50 @@ pub async fn open_recycle_password_window(
     state: tauri::State<'_, QLoginState>,
     recycle_state: tauri::State<'_, RecycleAuthState>,
 ) -> Result<(), String> {
-    if let Some(window) = app.get_webview_window(RECYCLE_WINDOW_LABEL) {
-        window.set_focus().ok();
-        return Ok(());
-    }
     let auth = state.qzone_auth().await?;
     if let Ok(mut guard) = recycle_state.pwd2sig.lock() {
         *guard = None;
     }
-    let page_url = Url::parse(&format!("https://user.qzone.qq.com/{}/photo/recycle", auth.uin))
-        .map_err(|error| format!("回收站地址无效：{error}"))?;
+    let page_url = Url::parse(&format!(
+        "https://user.qzone.qq.com/{}/photo/recycle",
+        auth.uin
+    ))
+    .map_err(|error| format!("回收站地址无效：{error}"))?;
+    if let Some(window) = app.get_webview_window(RECYCLE_WINDOW_LABEL) {
+        set_recycle_window_cookies(&window, &auth.cookie_header)?;
+        window
+            .navigate(page_url)
+            .map_err(|error| format!("打开独立密码验证页面失败：{error}"))?;
+        window.set_focus().ok();
+        return Ok(());
+    }
+    // The script runs inside each Qzone frame. A captured token is sent through a
+    // synthetic HTTPS navigation that the native navigation handler cancels, so
+    // the token never leaves this WebView and no cross-origin DOM access is needed.
     let bridge_script = r#"
       (() => {
+        if (window.__qzaPwd2sigBridge) return;
+        const host = location.hostname.toLowerCase();
+        if (host !== 'qzone.qq.com' && !host.endsWith('.qzone.qq.com')) return;
+        window.__qzaPwd2sigBridge = true;
         const prefix = '__QZA_PWD2SIG__';
+        let published = false;
         const publish = (token) => {
-          if (typeof token !== 'string' || token.length < 5) return;
-          document.title = prefix + token;
-          try { history.replaceState(null, '', location.pathname + location.search + '#pwd2sig=' + encodeURIComponent(token)); } catch (_) {}
-          try {
-            if (window.top && window.top !== window) {
-              window.top.document.title = prefix + token;
-              window.top.history.replaceState(null, '', window.top.location.pathname + window.top.location.search + '#pwd2sig=' + encodeURIComponent(token));
-            }
-          } catch (_) {}
+          if (published || typeof token !== 'string' || token.length < 5 || token.length > 4096) return;
+          published = true;
+          try { document.title = prefix + token; } catch (_) {}
+          try { location.replace('https://user.qzone.qq.com/__qza_pwd2sig__#pwd2sig=' + encodeURIComponent(token)); } catch (_) {}
         };
         const capture = (input) => {
           try {
             if (input instanceof FormData || input instanceof URLSearchParams) {
-              const token = input.get('pwd2sig'); if (token) publish(String(token));
+              const token = input.get('pwd2sig');
+              if (token) publish(String(token));
               return;
             }
-            const text = typeof input === 'string' ? input : input?.url || '';
-            const match = text.match(/(?:^|[?&])pwd2sig=([^&]+)/i);
+            if (input && typeof input === 'object' && input.url) capture(input.url);
+            const text = typeof input === 'string' ? input : '';
+            const match = text.match(/(?:[?&#]|^)pwd2sig=([^&#]+)/i);
             if (match) publish(decodeURIComponent(match[1].replace(/\+/g, ' ')));
           } catch (_) {}
         };
@@ -280,6 +386,10 @@ pub async fn open_recycle_password_window(
             }
           } catch (_) {}
           try {
+            for (const entry of w.performance.getEntriesByType('resource')) {
+              capture(entry.name);
+              if (published) return '';
+            }
             for (let i = 0; i < w.frames.length; i++) {
               const token = read(w.frames[i]);
               if (token) return token;
@@ -288,9 +398,10 @@ pub async fn open_recycle_password_window(
           return '';
         };
         const tick = () => {
-          const token = read(window.top || window);
+          const token = read(window);
           if (token) publish(token);
           try {
+            if (window !== window.top) return;
             const roots = [document];
             for (const frame of document.querySelectorAll('iframe')) {
               if (frame.contentDocument) roots.push(frame.contentDocument);
@@ -315,24 +426,52 @@ pub async fn open_recycle_password_window(
     let builder = WebviewWindowBuilder::new(
         &app,
         RECYCLE_WINDOW_LABEL,
-        WebviewUrl::External(Url::parse("about:blank").expect("about:blank 必须是有效 URL")),
+        // A packaged page provides WKWebView with a stable initial document while
+        // native cookies are installed, avoiding the about:blank navigation stall.
+        WebviewUrl::App("recycle-auth.html".into()),
     )
     .title("验证 QQ 空间独立密码")
-    .inner_size(960.0, 720.0);
+    .inner_size(960.0, 720.0)
+    .initialization_script_for_all_frames(bridge_script);
+    let nav_state = recycle_state.inner().clone();
+    let builder = builder.on_navigation(move |url| {
+        if url.scheme() == "https"
+            && url.host_str() == Some("user.qzone.qq.com")
+            && url.path() == RECYCLE_TOKEN_BRIDGE_PATH
+        {
+            if let Some(token) = pwd2sig_from_url(url.as_str()) {
+                store_pwd2sig(&nav_state, token);
+            }
+            return false;
+        }
+        if is_qzone_url(url) {
+            if let Some(token) = pwd2sig_from_url(url.as_str()) {
+                store_pwd2sig(&nav_state, token);
+            }
+        }
+        true
+    });
+    let title_state = recycle_state.inner().clone();
+    let builder = builder.on_document_title_changed(move |_window, title| {
+        if let Some(token) = title
+            .strip_prefix("__QZA_PWD2SIG__")
+            .filter(|token| valid_pwd2sig(token))
+        {
+            store_pwd2sig(&title_state, token.to_owned());
+        }
+    });
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let builder = builder.center();
     let window = builder
-    .initialization_script(bridge_script)
-    .build()
-    .map_err(|error| format!("打开独立密码验证窗口失败：{error}"))?;
+        .build()
+        .map_err(|error| format!("打开独立密码验证窗口失败：{error}"))?;
     #[cfg(windows)]
     install_recycle_request_listener(&window, recycle_state.inner().clone());
-    for entry in auth.cookie_header.split("; ") {
-        if let Ok(cookie) = format!("{entry}; Domain=.qq.com; Path=/").parse::<cookie::Cookie>() {
-            window.set_cookie(cookie).ok();
-        }
-    }
-    window.navigate(page_url).ok();
+    set_recycle_window_cookies(&window, &auth.cookie_header)?;
+    window
+        .navigate(page_url)
+        .map_err(|error| format!("打开独立密码验证页面失败：{error}"))?;
+    window.set_focus().ok();
     Ok(())
 }
 
@@ -340,89 +479,48 @@ pub async fn open_recycle_password_window(
 pub async fn check_recycle_password(
     app: tauri::AppHandle,
     recycle_state: tauri::State<'_, RecycleAuthState>,
-) -> Result<Option<String>, String> {
+) -> Result<RecyclePasswordStatus, String> {
     if let Ok(guard) = recycle_state.pwd2sig.lock() {
         if let Some(token) = guard.clone() {
-            return Ok(Some(token));
+            return Ok(RecyclePasswordStatus {
+                token: Some(token),
+                window_open: app.get_webview_window(RECYCLE_WINDOW_LABEL).is_some(),
+            });
         }
     }
     let Some(window) = app.get_webview_window(RECYCLE_WINDOW_LABEL) else {
-        return Ok(None);
-    };
-    window.eval(r#"(() => {
-      const publishFromUrl = (url) => {
-        try {
-          const match = String(url || '').match(/(?:^|[?&])pwd2sig=([^&]+)/i);
-          if (!match) return false;
-          const token = decodeURIComponent(match[1].replace(/\+/g, ' '));
-          history.replaceState(null, '', location.pathname + location.search + '#pwd2sig=' + encodeURIComponent(token));
-          return true;
-        } catch (_) { return false; }
-      };
-      const scanResources = (w) => {
-        try {
-          for (const entry of w.performance.getEntriesByType('resource')) if (publishFromUrl(entry.name)) return true;
-          for (let i = 0; i < w.frames.length; i++) if (scanResources(w.frames[i])) return true;
-        } catch (_) {}
-        return false;
-      };
-      if (scanResources(window)) return;
-      const seen = new WeakSet();
-      const findToken = (value, depth = 0) => {
-        if (!value || depth > 5 || (typeof value !== 'object' && typeof value !== 'function')) return '';
-        if (seen.has(value)) return ''; seen.add(value);
-        for (const key of Object.keys(value)) {
-          let child; try { child = value[key]; } catch (_) { continue; }
-          if (key.toLowerCase().includes('pwd2sig') && typeof child === 'string' && child.length > 4) return child;
-          const found = findToken(child, depth + 1); if (found) return found;
-        }
-        return '';
-      };
-      let token = '';
-      try { token = window.QZONE?.dataCenter?.get?.('pwd2sig') || ''; } catch (_) {}
-      try { token = token || window.QPHOTO?.dataCenter?.get?.('pwd2sig') || ''; } catch (_) {}
-      token = token || findToken(window.QZONE) || findToken(window.QPHOTO);
-      try {
-        for (const storage of [window.localStorage, window.sessionStorage]) {
-          for (let i = 0; i < storage.length; i++) {
-            const key = storage.key(i) || ''; const value = storage.getItem(key) || '';
-            if (key.toLowerCase().includes('pwd2sig') && value.length > 4) token = value;
-          }
-        }
-      } catch (_) {}
-      if (token) {
-        document.title = '__QZA_PWD2SIG__' + token;
-        try { history.replaceState(null, '', location.pathname + location.search + '#pwd2sig=' + encodeURIComponent(token)); } catch (_) {}
-      }
-    })()"#).ok();
-    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
-    let title = window.title().unwrap_or_default();
-    let current_url = window.url().ok().map(|url| url.to_string()).unwrap_or_default();
-    let parsed_url = Url::parse(&current_url).ok();
-    if let Some(token) = title.strip_prefix("__QZA_PWD2SIG__").filter(|value| !value.is_empty()) {
-        return Ok(Some(token.to_owned()));
-    }
-    if let Ok(cookies) = window.cookies() {
-        if let Some(token) = cookies
-            .iter()
-            .find(|cookie| cookie.name().eq_ignore_ascii_case("pwd2sig"))
-            .map(|cookie| cookie.value().to_owned())
-            .filter(|value| !value.is_empty())
-        {
-            return Ok(Some(token));
-        }
-    }
-    // 腾讯验证成功后通常会跳转到 callback.html，并把临时签名放在查询串或 hash 中。
-    let parsed = parsed_url;
-    let token_from_url = parsed.as_ref().and_then(|url| {
-        let from_pairs = |pairs: Vec<(String, String)>| pairs.into_iter().find_map(|(key, value)| {
-            (key.eq_ignore_ascii_case("pwd2sig") || key.eq_ignore_ascii_case("pwd2Sig")).then_some(value)
+        return Ok(RecyclePasswordStatus {
+            token: None,
+            window_open: false,
         });
-        from_pairs(url.query_pairs().map(|(key, value)| (key.into_owned(), value.into_owned())).collect())
-            .or_else(|| from_pairs(url::form_urlencoded::parse(url.fragment().unwrap_or_default().as_bytes())
-                .map(|(key, value)| (key.into_owned(), value.into_owned())).collect()))
-    });
-    Ok(token_from_url.filter(|value| !value.is_empty()))
+    };
+    window.eval("window.__qzaReadPwd2sig?.()").ok();
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    // Do not call WebviewWindow::url here. WKWebView temporarily has no URL while
+    // redirecting and wry 0.55.1 unwraps that nil value, crashing the macOS app.
+    let token = recycle_state
+        .pwd2sig
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .or_else(|| {
+            window.cookies().ok().and_then(|cookies| {
+                cookies.iter().find_map(|cookie| {
+                    cookie
+                        .name()
+                        .eq_ignore_ascii_case("pwd2sig")
+                        .then(|| cookie.value().to_owned())
+                        .filter(|token| valid_pwd2sig(token))
+                })
+            })
+        });
+    if let Some(token) = token.as_ref() {
+        store_pwd2sig(recycle_state.inner(), token.clone());
+    }
+    Ok(RecyclePasswordStatus {
+        token,
+        window_open: true,
+    })
 }
 
 #[tauri::command]
