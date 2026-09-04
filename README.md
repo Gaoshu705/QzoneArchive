@@ -22,21 +22,9 @@
 - 请勿从第三方渠道下载所谓的新版、修复版或其他衍生版本。
 - 对于第三方修改、分发或使用所产生的问题，本项目无法提供支持。
 
-## 官方仓库
-
-本项目的官方仓库地址为：
-
-**https://github.com/Gaoshu705/QzoneArchive**
-
-请仅通过以上地址确认项目公告及历史信息。
-
 ## 致谢
 
 再次感谢所有参与、反馈和支持过这个项目的人。项目虽然已经关闭，但大家给予的帮助与鼓励仍然值得珍惜。
-
-**如果这个项目曾经帮助过你，欢迎在 GitHub 上为项目点一个 Star。Your stars are our greatest motivation：**
-
-**https://github.com/Gaoshu705/QzoneArchive**
 
 ## 许可证说明
 
